@@ -12164,3 +12164,34 @@ for _key, _phrases in EXTRA_RESPONSES_7.items():
         if _phrase not in _bucket:
             _bucket.append(_phrase)
 DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
+
+# Bo sung tu ban xuat /cactukotrongtudien lan 4 (2026-07-05).
+EXTRA_RESPONSES_5 = {
+    "cưa": ["cưa gỗ", "cưa máy", "cưa đổ"],
+    "cảnh": ["cảnh sát"],
+    "dâm": ["dâm ô"],
+    "ô": ["ô nhiễm", "ô tô", "ô dù", "ô kìa"],
+    "nhiễm": ["nhiễm khuẩn", "nhiễm trùng", "nhiễm độc"],
+    "khuẩn": ["khuẩn lạc"],
+    "lưới": ["lưới thép", "lưới điện"],
+    "mạt": ["mạt cưa", "mạt vận"],
+    "nhuộm": ["nhuộm tóc", "nhuộm vải", "nhuộm màu"],
+    "quý": ["quý phi"],
+    "rẻ": ["rẻ mạt"],
+    "phẩm": ["phẩm nhuộm"],
+    "chì": ["chì chiết"],
+    "thép": ["thép gai"],
+    "trời": ["trời đất"],
+    "đá": ["đá bào", "đá quý"],
+}
+for _key, _phrases in EXTRA_RESPONSES_5.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
+
+# Thay the cho luong lu (bi chan vi tu cuoi lu tuyet duong).
+for _phrase in ["lưỡng cực", "lưỡng tính"]:
+    if _phrase not in RESPONSE_MAP["lưỡng"]:
+        RESPONSE_MAP["lưỡng"].append(_phrase)

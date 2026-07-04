@@ -111,6 +111,18 @@ WORD_GAME_ALWAYS_INVALID = {
     "mẻ nồi", "mẻ nếp", "nay đây", "trưa trực", "mai đó", "gù đầu",
     "hòang tử", "đẽ gọt", "nhóm sản", "trận w",
     "dầm thấm", "lự là", "lự một", "lự tình", "lự điều", "rãi rác",
+    # Tên riêng/địa danh không tính trong nối từ.
+    "lạc long", "thoại mỹ", "mạch khê",
+    # Rác sinh tự động và cụm ghép gượng.
+    "ty con", "ty mẹ", "ty lớn", "mạng xã", "ngoằng ngoăng", "ngoằng ngoằng",
+}
+# Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
+WORD_GAME_BOT_AVOID_PHRASES = {
+    "chì lưới", "thép nguội", "nát đời",
+}
+# Từ đuôi gần như không có đường nối chuẩn: bot cấm ra, khỏi gài chết người chơi.
+WORD_GAME_NO_EXIT_WORDS = {
+    "ngoằng", "lự",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -1218,6 +1230,8 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             and normalized not in used_phrases
             and not reverses_used_phrase(normalized, used_phrases)
             and not any(word in WORD_GAME_BANNED_WORDS for word in words)
+            and normalized not in WORD_GAME_BOT_AVOID_PHRASES
+            and words[-1] not in WORD_GAME_NO_EXIT_WORDS
         ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
@@ -1246,6 +1260,8 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
         or normalized in used_phrases
         or reverses_used_phrase(normalized, used_phrases)
         or any(word in WORD_GAME_BANNED_WORDS for word in words)
+        or normalized in WORD_GAME_BOT_AVOID_PHRASES
+        or words[-1] in WORD_GAME_NO_EXIT_WORDS
     ):
         return None
     return re.sub(r"\s+", " ", answer).strip().lower()
@@ -1257,8 +1273,10 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
         f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
         f"Không dùng các cụm đã dùng: {used}.\n"
-        "Cụm phải tự nhiên, người Việt hiểu được, nhưng ưu tiên cụm có TỪ CUỐI "
-        "hiếm và khó nối tiếp để làm khó đối thủ.\n"
+        "Cụm phải là từ ghép chuẩn, phổ biến với người Việt. KHÔNG dùng tên riêng/địa danh, "
+        "KHÔNG ghép gượng kiểu ty con, chì lưới, rãi rác.\n"
+        "Ưu tiên cụm có TỪ CUỐI hiếm, khó nối tiếp để làm khó đối thủ, "
+        "nhưng từ cuối đó vẫn phải còn ít nhất một cách nối chuẩn.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
     messages = [
@@ -1304,9 +1322,10 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
     prompt = (
         "Kiểm tra một lượt NỐI TỪ tiếng Việt. Cụm hợp lệ khi 2 từ ghép lại tạo ý nghĩa tự nhiên "
         "mà người Việt hiểu được; KHÔNG bắt buộc là thành ngữ hay cụm từ cố định trong từ điển.\n"
+        "Tên riêng, tên người, địa danh, nhãn hiệu đều INVALID (vd: lạc long, mạch khê, thoại mỹ, hà nội).\n"
         f"Cụm: {canonical}\n"
         "VALID: ảnh nét, túi da, ngọt lịm, người ngợm, nhiếc móc, hình ảnh, móc túi.\n"
-        "INVALID: ngợm nhiếc, đạc đồ, hài bài, ambient kính, hai từ ghép máy không tạo nghĩa.\n"
+        "INVALID: ngợm nhiếc, đạc đồ, hài bài, ambient kính, lạc long, hai từ ghép máy không tạo nghĩa.\n"
         "Chỉ trả đúng VALID hoặc INVALID."
     )
     messages = [
@@ -1333,7 +1352,9 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
                 "role": "user",
                 "content": (
                     f'Xét lại cụm "{canonical}". Nếu cụm diễn tả được một ý tự nhiên trong văn nói '
-                    "(kể cả danh từ+tính từ như ảnh nét) thì trả VALID. Chỉ khi thật sự vô nghĩa mới trả INVALID. "
+                    "(kể cả danh từ+tính từ như ảnh nét) thì trả VALID. "
+                    "Tên riêng, tên người, địa danh vẫn là INVALID. "
+                    "Chỉ khi thật sự vô nghĩa hoặc là tên riêng mới trả INVALID. "
                     "Chỉ trả đúng một nhãn."
                 ),
             },
