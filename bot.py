@@ -390,16 +390,16 @@ def remember_channel_message(channel_id, author_name, content):
         items.append({"author": author_name, "content": content[:300]})
 
 
-async def send_reply(message, content, remember=True):
+async def send_reply(message, content, remember=True, ping=True):
     content = (content or "...")[:2000]
     sent = await message.reply(
         content,
-        mention_author=False,
+        mention_author=ping,
         allowed_mentions=discord.AllowedMentions(
             everyone=False,
             roles=False,
             users=False,
-            replied_user=False,
+            replied_user=ping,
         ),
     )
     if remember:
@@ -411,20 +411,21 @@ async def send_reply_chunks(message, text):
     chunks = split_chunks(text)
     if not chunks:
         return
-    for part in chunks:
-        await send_reply(message, part)
+    # Cau tra loi dai chia nhieu tin thi chi ping o tin dau, khoi doi thong bao.
+    for index, part in enumerate(chunks):
+        await send_reply(message, part, ping=index == 0)
 
 
 async def send_roast_reply(message, content):
     content = (content or "...")[:2000]
     sent = await message.reply(
         content,
-        mention_author=False,
+        mention_author=True,
         allowed_mentions=discord.AllowedMentions(
             everyone=False,
             roles=False,
             users=True,
-            replied_user=False,
+            replied_user=True,
         ),
     )
     remember_channel_message(message.channel.id, "Zun", content)
