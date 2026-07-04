@@ -30,8 +30,8 @@ ANTHROPIC_API_KEY = (
     or ""
 ).strip()
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-ROAST_MODEL = os.getenv("ROAST_MODEL", "claude-sonnet-5")  # roast dung model thong minh hon
+MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
+ROAST_MODEL = os.getenv("ROAST_MODEL", "claude-sonnet-5")
 MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
@@ -665,7 +665,11 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
     use_model = model or MODEL
     extra = {}
     if use_model.startswith(NEWGEN_MODEL_PREFIXES):
-        max_tokens += thinking_budget
+        if thinking_budget > 0:
+            # adaptive thinking tu bat khi khong truyen thinking; chi can du cho trong max_tokens
+            max_tokens += thinking_budget
+        else:
+            extra["thinking"] = {"type": "disabled"}  # chat thuong: tra loi lien khong nghi
     elif thinking_budget > 0:
         extra["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
         max_tokens += thinking_budget
