@@ -59,6 +59,21 @@ GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_
 WORD_GAME_TIMEOUT_SECONDS = 5 * 60
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
+FAIR_WORD_GAME_STARTS = (
+    "ăn cơm", "đi học", "chơi game", "làm việc", "uống nước", "đọc sách",
+    "nghe nhạc", "xem phim", "nấu ăn", "mua đồ", "học bài", "vẽ tranh",
+    "chạy bộ", "ngủ trưa", "nói chuyện", "mở cửa", "trồng cây", "nuôi mèo",
+    "ăn sáng", "đọc truyện", "xây nhà", "bán hàng", "làm bánh", "uống sữa",
+    "đi chơi", "vào lớp", "học nhóm", "chơi bóng", "trồng rau", "nuôi chó",
+    "đổi tên", "cầm bút", "bắt đầu", "thả tim", "pha màu", "đi ngủ",
+    "chơi nhạc", "uống trà", "đọc báo", "nghe tin", "vẽ hình", "nói thật",
+    "trồng hoa", "nuôi cá", "ra đường", "thắng trận", "vui vẻ",
+)
+# Các hậu tố này xuất hiện hàng loạt trong phần dữ liệu sinh tự động; chỉ dùng khi
+# một key không còn lựa chọn tự nhiên nào khác.
+WORD_GAME_FILLER_WORDS = {
+    "bot", "bug", "code", "data", "file", "fix", "game", "key", "lag", "loi",
+}
 
 ACCOUNT_CONTEXT_BLOCKLIST = {
     "google", "gmail", "youtube", "yt", "facebook", "fb", "tiktok",
@@ -565,7 +580,7 @@ def ensure_word_game_dictionary():
     word_game_response_map = dict(normalized_map)
     word_game_dead_ends = {normalize_word_game_text(word) for word in DEAD_END_WORDS}
     word_game_start_pool = []
-    for phrase in START_PHRASES:
+    for phrase in FAIR_WORD_GAME_STARTS:
         words = normalize_word_game_text(phrase).split()
         if len(words) == 2 and words[-1] not in word_game_dead_ends and words[-1] in word_game_response_map:
             word_game_start_pool.append(phrase)
@@ -591,14 +606,13 @@ def choose_dictionary_word_response(last_word, used_phrases):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
-    dead_end_candidates = [item for item in candidates if item[2] in word_game_dead_ends]
-    if dead_end_candidates:
-        return random.choice(dead_end_candidates)[0]
-    # Ít câu mở tiếp hơn = khó hơn; random trong nhóm khó nhất để bot đỡ lặp.
-    candidates.sort(key=lambda item: len(word_game_response_map.get(item[2], ())))
-    hardest_score = len(word_game_response_map.get(candidates[0][2], ()))
-    hardest = [item for item in candidates if len(word_game_response_map.get(item[2], ())) == hardest_score]
-    return random.choice(hardest)[0]
+    # RESPONSE_MAP xếp cụm tự nhiên trước, phần sinh tự động nằm sau. Chỉ quét nhóm
+    # đầu, tránh từ cụt và hậu tố filler để ván chơi công bằng, dễ hiểu.
+    candidates = candidates[:4]
+    non_dead = [item for item in candidates if item[2] not in word_game_dead_ends]
+    pool = non_dead or candidates
+    natural = [item for item in pool if item[2] not in WORD_GAME_FILLER_WORDS]
+    return random.choice(natural or pool)[0]
 
 
 def validate_ai_word_response(answer, last_word, used_phrases):
@@ -620,7 +634,7 @@ async def ai_word_game_fallback(last_word, used_phrases):
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
         f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
         f"Không dùng các cụm đã dùng: {used}.\n"
-        "Ưu tiên cụm có từ cuối khó nối.\n"
+        "Ưu tiên cụm tự nhiên, phổ biến và có thể nối tiếp.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
     messages = [
@@ -719,7 +733,8 @@ async def handle_word_game_session(message, prompt, session):
         })
         await send_reply(
             message,
-            f"ok cược {bet:,}đ\nt ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
+            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp\n"
+            f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
             remember=False,
         )
         return
@@ -758,13 +773,6 @@ async def handle_word_game_session(message, prompt, session):
     session["last_word"] = response_words[-1]
     session["updated_at"] = time.time()
 
-    if response_words[-1] in word_game_dead_ends:
-        await finish_word_game_loss(
-            message,
-            session,
-            f't nối: {response}\ntừ "{response_words[-1]}" gần như hết đường nối rồi',
-        )
-        return
     await send_reply(
         message,
         f"hợp lệ\nt nối: {response}\nm nối tiếp bằng: {response_words[-1]}",
