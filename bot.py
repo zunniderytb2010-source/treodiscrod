@@ -1019,8 +1019,6 @@ async def on_message(message):
             mood = guild_mood.get(gid, "normal")
             choices = SNARKS if zun_variant_called(content) and mood == "lao" else GREETINGS
             reply = choose_short_reply(message.channel.id, choices)
-        async with message.channel.typing():
-            await asyncio.sleep(random.uniform(0.5, 1.3))
         await send_reply(message, reply)
         return
 
@@ -1034,8 +1032,6 @@ async def on_message(message):
                 pass
             return
         reply = choose_short_reply(message.channel.id, quick_choices)
-        async with message.channel.typing():
-            await asyncio.sleep(random.uniform(0.5, 1.3))
         await send_reply(message, reply)
         return
 
@@ -1047,8 +1043,6 @@ async def on_message(message):
             except Exception:
                 pass
             return
-        async with message.channel.typing():
-            await asyncio.sleep(random.uniform(0.5, 1.3))
         await handle_short_insult(message, prompt)
         return
 
