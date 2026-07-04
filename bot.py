@@ -755,32 +755,35 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
     return answer
 
 
-async def ai_task(gid, task, user_content, max_tokens=400, temperature=0.85):
+async def ai_task(gid, task, user_content, max_tokens=400, temperature=0.85, thinking_budget=0):
     """Task 1 lần, ko memory (roast, quote, summarize, translate)."""
     system = build_system(gid) + "\n\nNhiệm vụ lần này: " + task
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
-    return await _claude(messages, max_tokens, temperature)
+    return await _claude(messages, max_tokens, temperature, thinking_budget)
 
 
 async def make_roast(gid, target_name, channel_id=None):
     context = build_channel_context(channel_id) if channel_id else ""
     task = (
-        f"viết ĐÚNG 1-2 câu roast {target_name}. Phong cách gen z 2026: cụt, bất ngờ, meme, viết thường, đọc phát cười phát.\n"
-        "- Có [Tin nhắn gần đây trong kênh] thì bám vào đúng cái nó vừa nói/cách nó gõ mà roast, càng cá nhân càng đau.\n"
+        f"viết ĐÚNG 1 câu roast {target_name}, TỐI ĐA 20 từ, có twist bất ngờ ở cuối, đọc phát cười phát.\n"
+        "- Trong lúc suy nghĩ hãy nghĩ ra 3-4 hướng roast khác nhau rồi CHỌN câu đau và gọn nhất mới trả lời.\n"
+        "- Cấm viết dài vòng vo, cấm nối 'mà... vẫn...' lê thê, cấm giải thích joke. Punchline phải nằm cuối câu.\n"
+        "- Cấm mở đầu bằng tên nó kiểu 'X đấy chứ ai', cấm 'thằng này', 'kiểu người'. Vào thẳng câu chọc.\n"
+        "- Có [Tin nhắn gần đây trong kênh] thì bám vào đúng cái nó vừa nói/cách nó gõ mà chọc, càng cá nhân càng đau.\n"
         "- Không biết gì về nó thì chế từ cái tên hoặc vibe gamer. TUYỆT ĐỐI không hỏi context, "
-        "không nói kiểu 't không biết ai là...', 'cụ thể hơn đi'. Kiểu gì cũng phải phun ra một câu roast.\n"
-        "- CẤM từ bro. Cấm mở đầu bằng 'thằng này', 'kiểu người'. Cấm so sánh cũ rích kiểu google translate, thời đồ đá, tiền sử.\n"
+        "không nói kiểu 't không biết ai là...'. Kiểu gì cũng phải phun ra roast.\n"
+        "- CẤM từ bro. Cấm so sánh cũ rích kiểu google translate, thời đồ đá, tiền sử.\n"
         "- Không lặp lại hay na ná câu roast Zun đã dùng trong tin nhắn gần đây, mỗi lần một góc chọc mới.\n"
-        "- Vibe tham khảo (chế mới, đừng copy): 'tên nghe như mật khẩu wifi quán net', "
-        "'afk từ trong game ra tới ngoài đời', 'nó là lý do game có nút report', 'đến autocorrect còn lười sửa cho nó'.\n"
+        "- Chuẩn độ gọn (chế mới, cấm copy): 'tên nghe như mật khẩu wifi quán net', "
+        "'nó là lý do game có nút report', 'ping cao đổ tại mạng, chơi ngu thì đổ tại ai'.\n"
         "- Ko từ cấm, ko chủng tộc, ko đụng gia đình, ko đe doạ, ko body-shaming nặng.\n"
-        "Chỉ trả về câu roast, ko giải thích."
+        "Chỉ trả về đúng câu roast."
     )
     user_content = f"{context}\n\nRoast {target_name} đi" if context else f"Roast {target_name} đi"
-    return await ai_task(gid, task, user_content, max_tokens=200, temperature=1.0)
+    return await ai_task(gid, task, user_content, max_tokens=200, temperature=1.0, thinking_budget=1024)
 
 
 def extract_prompt(message):
