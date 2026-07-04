@@ -425,6 +425,13 @@ def normalize_word_game_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def canonical_word_game_text(text):
+    """Chuẩn hoá câu chơi nhưng giữ dấu Việt để sáng không bị nhập chung với sang."""
+    text = unicodedata.normalize("NFC", (text or "").lower())
+    text = "".join(ch if ch.isalnum() else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def save_game_data():
     """Ghi file tạm rồi replace để hạn chế JSON bị dở khi process tắt ngang."""
     temp_path = GAME_DATA_FILE + ".tmp"
@@ -576,15 +583,15 @@ def ensure_word_game_dictionary():
         return
     normalized_map = defaultdict(list)
     for key, phrases in RESPONSE_MAP.items():
-        normalized_key = normalize_word_game_text(key)
+        normalized_key = canonical_word_game_text(key)
         for phrase in phrases:
-            if len(normalize_word_game_text(phrase).split()) == 2:
+            if len(canonical_word_game_text(phrase).split()) == 2:
                 normalized_map[normalized_key].append(phrase)
     word_game_response_map = dict(normalized_map)
-    word_game_dead_ends = {normalize_word_game_text(word) for word in DEAD_END_WORDS}
+    word_game_dead_ends = {canonical_word_game_text(word) for word in DEAD_END_WORDS}
     word_game_start_pool = []
     for phrase in FAIR_WORD_GAME_STARTS:
-        words = normalize_word_game_text(phrase).split()
+        words = canonical_word_game_text(phrase).split()
         if len(words) == 2 and words[-1] not in word_game_dead_ends and words[-1] in word_game_response_map:
             word_game_start_pool.append(phrase)
     log.info(
@@ -603,7 +610,7 @@ def choose_dictionary_word_response(last_word, used_phrases):
     ensure_word_game_dictionary()
     candidates = []
     for phrase in word_game_response_map.get(last_word, []):
-        normalized = normalize_word_game_text(phrase)
+        normalized = canonical_word_game_text(phrase)
         words = normalized.split()
         if len(words) == 2 and words[0] == last_word and normalized not in used_phrases:
             candidates.append((phrase, normalized, words[-1]))
@@ -624,7 +631,7 @@ def validate_ai_word_response(answer, last_word, used_phrases):
         return None
     if not all(ch.isalpha() or ch.isspace() for ch in answer):
         return None
-    normalized = normalize_word_game_text(answer)
+    normalized = canonical_word_game_text(answer)
     words = normalized.split()
     if len(words) != 2 or words[0] != last_word or normalized in used_phrases:
         return None
@@ -724,13 +731,13 @@ async def handle_word_game_session(message, prompt, session):
         profile["balance"] -= bet
         save_game_data()
         start_phrase = choose_word_game_start()
-        words = normalize_word_game_text(start_phrase).split()
+        words = canonical_word_game_text(start_phrase).split()
         session.update({
             "state": "active",
             "bet": bet,
             "current_phrase": start_phrase,
             "last_word": words[-1],
-            "used_phrases": {normalize_word_game_text(start_phrase)},
+            "used_phrases": {canonical_word_game_text(start_phrase)},
             "started_at": now,
             "updated_at": now,
         })
@@ -742,7 +749,8 @@ async def handle_word_game_session(message, prompt, session):
         )
         return
 
-    words = plain.split()
+    phrase_key = canonical_word_game_text(prompt)
+    words = phrase_key.split()
     if len(words) != 2:
         await finish_word_game_loss(message, session, "sai luật rồi, phải nói đúng 2 từ")
         return
@@ -753,12 +761,12 @@ async def handle_word_game_session(message, prompt, session):
             f'sai luật rồi, phải bắt đầu bằng "{session["last_word"]}"',
         )
         return
-    if plain in session["used_phrases"]:
+    if phrase_key in session["used_phrases"]:
         await finish_word_game_loss(message, session, "cụm đó dùng rồi")
         return
 
-    session["used_phrases"].add(plain)
-    session["current_phrase"] = prompt
+    session["used_phrases"].add(phrase_key)
+    session["current_phrase"] = phrase_key
     session["last_word"] = words[-1]
     session["updated_at"] = now
 
@@ -769,7 +777,7 @@ async def handle_word_game_session(message, prompt, session):
         await finish_word_game_win(message, session)
         return
 
-    response_normalized = normalize_word_game_text(response)
+    response_normalized = canonical_word_game_text(response)
     response_words = response_normalized.split()
     session["used_phrases"].add(response_normalized)
     session["current_phrase"] = response
