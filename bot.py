@@ -89,13 +89,15 @@ WORD_GAME_ALWAYS_VALID = {
     "chụp hình", "đây đó", "nay mai", "nay mưa", "nay nắng",
     "cụ thể", "thể hiện", "hiện nay", "trưa nay", "mai đi", "đi ngủ",
     "ngủ gật", "gật gù", "gù lưng", "lưng áo", "áo khoác",
+    "bài gửi", "hoàng tử", "khát vọng", "thi công", "tiền tệ", "trai xinh",
+    "tệ nạn", "điền kinh", "đói khát", "đạc điền", "đẹp đẽ", "đồ đạc",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
     "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
     "mẻ nồi", "mẻ nếp", "nay đây", "trưa trực", "mai đó", "gù đầu",
-    "nhóm sản", "trận w",
+    "hòang tử", "đẽ gọt", "nhóm sản", "trận w",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -345,6 +347,7 @@ latest_bot_analysis = {}                          # guild_id -> bot_id
 game_profiles = {}                                # discord user id string -> profile
 word_game_sessions = {}                           # (channel_id, user_id) -> session
 word_game_locks = defaultdict(asyncio.Lock)       # (channel_id, user_id) -> khoá chống 2 tin xử lý chồng
+balance_lock = asyncio.Lock()                     # chống trade/nạp tiền xử lý chồng số dư
 word_game_response_map = None                     # normalized dictionary, built lazily
 word_game_dead_ends = None                        # normalized dead-end words
 word_game_start_pool = None                       # easy starts, built lazily
@@ -2412,6 +2415,85 @@ async def slash_reset(interaction: discord.Interaction):
     await interaction.response.send_message("xoá não xong, m là ai t đếch nhớ")
 
 
+@bot.tree.command(name="trade", description="Chuyển tiền game cho người khác")
+@app_commands.guild_only()
+@app_commands.describe(nguoinhan="Người nhận tiền", sotien="Số tiền muốn chuyển")
+async def slash_trade(
+    interaction: discord.Interaction,
+    nguoinhan: discord.Member,
+    sotien: int,
+):
+    if sotien <= 0:
+        await interaction.response.send_message("số tiền trade phải lớn hơn 0", ephemeral=True)
+        return
+    if nguoinhan.id == interaction.user.id:
+        await interaction.response.send_message("tự trade cho mình làm j", ephemeral=True)
+        return
+    if nguoinhan.bot:
+        await interaction.response.send_message("bot không có tài khoản để nhận tiền", ephemeral=True)
+        return
+
+    async with balance_lock:
+        sender = game_profile_for(interaction.user)
+        receiver = game_profile_for(nguoinhan)
+        if sender is None:
+            error = "m chưa có tài khoản, gọi Zun tạo tài khoản trước"
+        elif receiver is None:
+            error = "người nhận chưa có tài khoản game"
+        elif sender["balance"] < sotien:
+            error = f"m không đủ tiền, số dư hiện có {sender['balance']:,}đ"
+        else:
+            sender["balance"] -= sotien
+            receiver["balance"] += sotien
+            sender["name"] = interaction.user.display_name
+            receiver["name"] = nguoinhan.display_name
+            save_game_data()
+            error = None
+            sender_balance = sender["balance"]
+            receiver_balance = receiver["balance"]
+
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"trade thành công **{sotien:,}đ** cho {nguoinhan.mention}\n"
+        f"số dư m: **{sender_balance:,}đ** · số dư người nhận: **{receiver_balance:,}đ**"
+    )
+
+
+@bot.tree.command(name="naptien", description="Nạp tiền game tùy ý (chỉ chủ bot)")
+@app_commands.describe(sotien="Số tiền muốn nạp", nguoinhan="Để trống để nạp cho chính m")
+async def slash_deposit_money(
+    interaction: discord.Interaction,
+    sotien: int,
+    nguoinhan: discord.Member = None,
+):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
+        return
+    if sotien <= 0:
+        await interaction.response.send_message("số tiền nạp phải lớn hơn 0", ephemeral=True)
+        return
+    target = nguoinhan or interaction.user
+    async with balance_lock:
+        profile = game_profile_for(target)
+        if profile is None:
+            error = "người này chưa có tài khoản game"
+        else:
+            profile["balance"] += sotien
+            profile["name"] = target.display_name
+            save_game_data()
+            error = None
+            new_balance = profile["balance"]
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"đã nạp **{sotien:,}đ** cho {target.mention}\nsố dư mới: **{new_balance:,}đ**",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(
     name="cactukotrongtudien",
     description="Xuất các cụm nối từ ngoài từ điển (chỉ chủ bot)",
@@ -2444,6 +2526,8 @@ def build_help_text():
         "`Zun tạo tài khoản` mở profile game\n"
         "`Zun profile` xem tiền/thắng thua\n"
         "`Zun chơi nối từ` chơi nối từ đặt cược\n"
+        "`/trade` chuyển tiền cho profile khác\n"
+        "`/naptien` nạp tiền tùy ý, chỉ owner\n"
         "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
         "`?ban @user [lý do]` ban, chỉ owner\n"
         "`Zun bật/tắt thinking` chỉ owner\n"
