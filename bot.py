@@ -762,6 +762,92 @@ def format_game_profile(profile, heading=None):
     )
 
 
+async def transfer_game_money(sender_user, receiver_user, amount):
+    if amount is None or amount <= 0:
+        return "số tiền trade phải lớn hơn 0", None, None
+    if receiver_user.id == sender_user.id:
+        return "tự trade cho mình làm j", None, None
+    if getattr(receiver_user, "bot", False):
+        return "bot không có tài khoản để nhận tiền", None, None
+    async with balance_lock:
+        sender = game_profile_for(sender_user)
+        receiver = game_profile_for(receiver_user)
+        if sender is None:
+            return "m chưa có tài khoản, gọi Zun tạo tài khoản trước", None, None
+        if receiver is None:
+            return "người nhận chưa có tài khoản game", None, None
+        if sender["balance"] < amount:
+            return f"m không đủ tiền, số dư hiện có {sender['balance']:,}đ", None, None
+        sender["balance"] -= amount
+        receiver["balance"] += amount
+        sender["name"] = sender_user.display_name
+        receiver["name"] = receiver_user.display_name
+        save_game_data()
+        return None, sender["balance"], receiver["balance"]
+
+
+async def deposit_game_money(target_user, amount):
+    if amount is None or amount <= 0:
+        return "số tiền nạp phải lớn hơn 0", None
+    async with balance_lock:
+        profile = game_profile_for(target_user)
+        if profile is None:
+            return "người này chưa có tài khoản game", None
+        profile["balance"] += amount
+        profile["name"] = target_user.display_name
+        save_game_data()
+        return None, profile["balance"]
+
+
+def parse_text_economy_amount(content):
+    args = re.sub(r"<@!?\d+>", " ", (content or "").strip())
+    args = re.sub(r"^/(?:naptien|trade)\b", "", args, flags=re.IGNORECASE).strip()
+    return parse_word_game_bet(args)
+
+
+async def handle_text_economy_command(message, content):
+    command_match = re.match(r"^/(naptien|trade)(?:\s|$)", content or "", re.IGNORECASE)
+    if not command_match:
+        return False
+    command = command_match.group(1).lower()
+    amount = parse_text_economy_amount(content)
+    targets = [user for user in message.mentions if not bot.user or user.id != bot.user.id]
+
+    if command == "naptien":
+        if not is_owner(message.author):
+            await send_reply(message, "lệnh này chỉ chủ bot dùng được")
+            return True
+        target = targets[0] if targets else message.author
+        error, new_balance = await deposit_game_money(target, amount)
+        if error:
+            await send_reply(message, error)
+        else:
+            await send_reply(
+                message,
+                f"đã nạp {amount:,}đ cho {target.mention}\nsố dư mới: {new_balance:,}đ",
+                ping=False,
+            )
+        return True
+
+    if not targets:
+        await send_reply(message, "dùng /trade @người số_tiền")
+        return True
+    target = targets[0]
+    error, sender_balance, receiver_balance = await transfer_game_money(
+        message.author, target, amount,
+    )
+    if error:
+        await send_reply(message, error)
+    else:
+        await send_reply(
+            message,
+            f"trade thành công {amount:,}đ cho {target.mention}\n"
+            f"số dư m: {sender_balance:,}đ · số dư người nhận: {receiver_balance:,}đ",
+            ping=False,
+        )
+    return True
+
+
 def contains_blocked_account_context(plain):
     padded = f" {plain} "
     return any(f" {item} " in padded for item in ACCOUNT_CONTEXT_BLOCKLIST)
@@ -2161,6 +2247,7 @@ async def on_message(message):
     mentioned = bot.user in message.mentions
     wake = bool(ZUN_WAKE_RE.search(content))
     prefix_moderation = bool(re.match(r"^\?(?:mute|ban)(?:\s|$)", content, re.IGNORECASE))
+    text_economy_command = bool(re.match(r"^/(?:naptien|trade)(?:\s|$)", content, re.IGNORECASE))
 
     # Resolve một lần để vừa nhận biết reply Zun, vừa dùng đúng tin gốc làm context.
     ref = None
@@ -2175,7 +2262,10 @@ async def on_message(message):
                 pass
     reply_to_bot = bool(ref and bot.user and ref.author.id == bot.user.id)
 
-    if not (is_ask or mentioned or wake or reply_to_bot or prefix_moderation or has_game_session):
+    if not (
+        is_ask or mentioned or wake or reply_to_bot or prefix_moderation
+        or text_economy_command or has_game_session
+    ):
         return
 
     gid = get_gid(message)
@@ -2185,6 +2275,8 @@ async def on_message(message):
         prompt = content[5:].strip()
     else:
         prompt = extract_prompt(message)
+    if text_economy_command and await handle_text_economy_command(message, content):
+        return
     invoked = is_ask or mentioned or wake or reply_to_bot
     if await handle_word_game_intents(message, prompt, invoked, ref):
         return
@@ -2423,35 +2515,9 @@ async def slash_trade(
     nguoinhan: discord.Member,
     sotien: int,
 ):
-    if sotien <= 0:
-        await interaction.response.send_message("số tiền trade phải lớn hơn 0", ephemeral=True)
-        return
-    if nguoinhan.id == interaction.user.id:
-        await interaction.response.send_message("tự trade cho mình làm j", ephemeral=True)
-        return
-    if nguoinhan.bot:
-        await interaction.response.send_message("bot không có tài khoản để nhận tiền", ephemeral=True)
-        return
-
-    async with balance_lock:
-        sender = game_profile_for(interaction.user)
-        receiver = game_profile_for(nguoinhan)
-        if sender is None:
-            error = "m chưa có tài khoản, gọi Zun tạo tài khoản trước"
-        elif receiver is None:
-            error = "người nhận chưa có tài khoản game"
-        elif sender["balance"] < sotien:
-            error = f"m không đủ tiền, số dư hiện có {sender['balance']:,}đ"
-        else:
-            sender["balance"] -= sotien
-            receiver["balance"] += sotien
-            sender["name"] = interaction.user.display_name
-            receiver["name"] = nguoinhan.display_name
-            save_game_data()
-            error = None
-            sender_balance = sender["balance"]
-            receiver_balance = receiver["balance"]
-
+    error, sender_balance, receiver_balance = await transfer_game_money(
+        interaction.user, nguoinhan, sotien,
+    )
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
@@ -2471,20 +2537,8 @@ async def slash_deposit_money(
     if not is_owner(interaction.user):
         await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
         return
-    if sotien <= 0:
-        await interaction.response.send_message("số tiền nạp phải lớn hơn 0", ephemeral=True)
-        return
     target = nguoinhan or interaction.user
-    async with balance_lock:
-        profile = game_profile_for(target)
-        if profile is None:
-            error = "người này chưa có tài khoản game"
-        else:
-            profile["balance"] += sotien
-            profile["name"] = target.display_name
-            save_game_data()
-            error = None
-            new_balance = profile["balance"]
+    error, new_balance = await deposit_game_money(target, sotien)
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
