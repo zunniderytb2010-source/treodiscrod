@@ -606,13 +606,25 @@ def choose_word_game_start():
     return random.choice(word_game_start_pool or START_PHRASES)
 
 
-def choose_dictionary_word_response(last_word, used_phrases):
+def reverses_used_phrase(phrase, used_phrases):
+    words = canonical_word_game_text(phrase).split()
+    return len(words) == 2 and f"{words[1]} {words[0]}" in used_phrases
+
+
+def choose_dictionary_word_response(last_word, used_phrases, used_required_words=None):
     ensure_word_game_dictionary()
+    used_required_words = used_required_words or set()
     candidates = []
     for phrase in word_game_response_map.get(last_word, []):
         normalized = canonical_word_game_text(phrase)
         words = normalized.split()
-        if len(words) == 2 and words[0] == last_word and normalized not in used_phrases:
+        if (
+            len(words) == 2
+            and words[0] == last_word
+            and normalized not in used_phrases
+            and words[-1] not in used_required_words
+            and not reverses_used_phrase(normalized, used_phrases)
+        ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
@@ -625,7 +637,7 @@ def choose_dictionary_word_response(last_word, used_phrases):
     return random.choice(natural or pool)[0]
 
 
-def validate_ai_word_response(answer, last_word, used_phrases):
+def validate_ai_word_response(answer, last_word, used_phrases, used_required_words=None):
     answer = (answer or "").strip().strip("`*_\"'")
     if not answer or answer.upper() == "PASS" or len(answer) > 30 or "\n" in answer:
         return None
@@ -633,17 +645,25 @@ def validate_ai_word_response(answer, last_word, used_phrases):
         return None
     normalized = canonical_word_game_text(answer)
     words = normalized.split()
-    if len(words) != 2 or words[0] != last_word or normalized in used_phrases:
+    if (
+        len(words) != 2
+        or words[0] != last_word
+        or normalized in used_phrases
+        or words[-1] in (used_required_words or set())
+        or reverses_used_phrase(normalized, used_phrases)
+    ):
         return None
     return re.sub(r"\s+", " ", answer).strip().lower()
 
 
-async def ai_word_game_fallback(last_word, used_phrases):
+async def ai_word_game_fallback(last_word, used_phrases, used_required_words=None):
     used = ", ".join(sorted(used_phrases)[:WORD_GAME_MAX_AI_USED])
+    used_words = ", ".join(sorted(used_required_words or set()))
     prompt = (
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
         f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
         f"Không dùng các cụm đã dùng: {used}.\n"
+        f"Không kết thúc bằng các từ đã nối qua: {used_words}.\n"
         "Ưu tiên cụm tự nhiên, phổ biến và có thể nối tiếp.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
@@ -656,7 +676,7 @@ async def ai_word_game_fallback(last_word, used_phrases):
     except Exception as exc:
         log.warning("AI nối từ fallback lỗi (%s)", type(exc).__name__)
         return None
-    return validate_ai_word_response(answer, last_word, used_phrases)
+    return validate_ai_word_response(answer, last_word, used_phrases, used_required_words)
 
 
 def update_game_result(profile, won):
@@ -738,12 +758,13 @@ async def handle_word_game_session(message, prompt, session):
             "current_phrase": start_phrase,
             "last_word": words[-1],
             "used_phrases": {canonical_word_game_text(start_phrase)},
+            "used_required_words": {words[-1]},
             "started_at": now,
             "updated_at": now,
         })
         await send_reply(
             message,
-            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp\n"
+            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hay quay vòng\n"
             f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
             remember=False,
         )
@@ -764,15 +785,24 @@ async def handle_word_game_session(message, prompt, session):
     if phrase_key in session["used_phrases"]:
         await finish_word_game_loss(message, session, "cụm đó dùng rồi")
         return
+    used_required_words = session.setdefault("used_required_words", {session["last_word"]})
+    if words[-1] in used_required_words:
+        await finish_word_game_loss(message, session, f'từ "{words[-1]}" đã nối qua rồi, không quay vòng')
+        return
 
     session["used_phrases"].add(phrase_key)
+    used_required_words.add(words[-1])
     session["current_phrase"] = phrase_key
     session["last_word"] = words[-1]
     session["updated_at"] = now
 
-    response = choose_dictionary_word_response(session["last_word"], session["used_phrases"])
+    response = choose_dictionary_word_response(
+        session["last_word"], session["used_phrases"], used_required_words,
+    )
     if response is None:
-        response = await ai_word_game_fallback(session["last_word"], session["used_phrases"])
+        response = await ai_word_game_fallback(
+            session["last_word"], session["used_phrases"], used_required_words,
+        )
     if response is None:
         await finish_word_game_win(message, session)
         return
@@ -780,6 +810,7 @@ async def handle_word_game_session(message, prompt, session):
     response_normalized = canonical_word_game_text(response)
     response_words = response_normalized.split()
     session["used_phrases"].add(response_normalized)
+    used_required_words.add(response_words[-1])
     session["current_phrase"] = response
     session["last_word"] = response_words[-1]
     session["updated_at"] = time.time()
