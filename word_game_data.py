@@ -12065,3 +12065,15 @@ for _key, _phrases in EXTRA_RESPONSES_2.items():
         if _phrase not in _bucket:
             _bucket.append(_phrase)
 DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
+
+# Bo sung tu ban xuat /cactukotrongtudien lan 2 (2026-07-05).
+EXTRA_RESPONSES_3 = {
+    "họa": ["họa mi"],
+    "mi": ["mi mắt", "mi cong", "mi giả"],
+}
+for _key, _phrases in EXTRA_RESPONSES_3.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}

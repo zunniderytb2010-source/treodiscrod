@@ -453,9 +453,27 @@ def normalize_word_game_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Tiếng Việt có 2 kiểu đặt dấu (hoạ/họa, thuý/thúy); gom về một dạng để khớp từ điển.
+_TONE_PLACEMENT_MAP = {
+    "oà": "òa", "oá": "óa", "oả": "ỏa", "oã": "õa", "oạ": "ọa",
+    "oè": "òe", "oé": "óe", "oẻ": "ỏe", "oẽ": "õe", "oẹ": "ọe",
+}
+# Riêng "uy" phải chừa chữ sau "q": "quý", "quỳ" vốn đặt dấu trên y là đúng.
+_TONE_PLACEMENT_UY_RES = [
+    (re.compile(r"(?<!q)uỳ"), "ùy"), (re.compile(r"(?<!q)uý"), "úy"),
+    (re.compile(r"(?<!q)uỷ"), "ủy"), (re.compile(r"(?<!q)uỹ"), "ũy"),
+    (re.compile(r"(?<!q)uỵ"), "ụy"),
+]
+
+
 def canonical_word_game_text(text):
     """Chuẩn hoá câu chơi nhưng giữ dấu Việt để sáng không bị nhập chung với sang."""
     text = unicodedata.normalize("NFC", (text or "").lower())
+    for old, new in _TONE_PLACEMENT_MAP.items():
+        if old in text:
+            text = text.replace(old, new)
+    for pattern, new in _TONE_PLACEMENT_UY_RES:
+        text = pattern.sub(new, text)
     text = "".join(ch if ch.isalnum() else " " for ch in text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -908,6 +926,16 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
     return validate_ai_word_response(answer, last_word, used_phrases, used_required_words)
 
 
+def _parse_word_game_verdict(text):
+    """Bắt VALID/INVALID kể cả khi AI trả lời dài dòng; không rõ thì None."""
+    upper = (text or "").upper()
+    if re.search(r"\bINVALID\b", upper):
+        return False
+    if re.search(r"\bVALID\b", upper):
+        return True
+    return None
+
+
 async def judge_word_game_phrase(phrase, source="không rõ"):
     """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau."""
     canonical = canonical_word_game_text(phrase)
@@ -944,9 +972,10 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
         record_unknown_word_phrase(canonical, source)
         return None
-    if re.fullmatch(r"\s*VALID[.!]?\s*", verdict, re.IGNORECASE):
+    parsed = _parse_word_game_verdict(verdict)
+    if parsed is True:
         valid = True
-    elif re.fullmatch(r"\s*INVALID[.!]?\s*", verdict, re.IGNORECASE):
+    elif parsed is False:
         # Recheck theo hướng tìm ngữ cảnh hợp lý để giảm false-negative như "ảnh nét".
         recheck_messages = [
             {
@@ -967,13 +996,11 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         except Exception:
             record_unknown_word_phrase(canonical, source)
             return None
-        if re.fullmatch(r"\s*VALID[.!]?\s*", recheck, re.IGNORECASE):
-            valid = True
-        elif re.fullmatch(r"\s*INVALID[.!]?\s*", recheck, re.IGNORECASE):
-            valid = False
-        else:
+        rechecked = _parse_word_game_verdict(recheck)
+        if rechecked is None:
             record_unknown_word_phrase(canonical, source)
             return None
+        valid = rechecked
     else:
         record_unknown_word_phrase(canonical, source)
         return None
@@ -983,7 +1010,7 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
 
 
 async def choose_semantic_word_response(last_word, used_phrases, used_required_words):
-    """Thử tối đa 4 câu dictionary; chỉ trả câu đã qua kiểm nghĩa."""
+    """Thử tối đa 4 câu dictionary rồi AI fallback; chỉ loại khi chấm ra INVALID rõ ràng."""
     rejected = set()
     for _ in range(4):
         candidate = choose_dictionary_word_response(
@@ -994,7 +1021,8 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
         if candidate is None:
             break
         verdict = await judge_word_game_phrase(candidate, source="bot kiểm tra từ điển")
-        if verdict is True:
+        if verdict is not False:
+            # Chấm lỗi/không rõ thì vẫn chơi, thà ra từ hơi lạ còn hơn bí oan.
             return candidate
         rejected.add(canonical_word_game_text(candidate))
 
@@ -1003,7 +1031,7 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
         candidate = await ai_word_game_fallback(
             last_word, used_phrases, used_required_words, temperature=temperature,
         )
-        if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is True:
+        if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is not False:
             return candidate
     return None
 
