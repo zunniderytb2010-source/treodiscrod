@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import io
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ IMAGE_MEDIA_TYPES = {
     ".webp": "image/webp",
 }
 GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_data.json")
+UNKNOWN_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unknown_word_phrases.json")
 WORD_GAME_TIMEOUT_SECONDS = 5 * 60
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
@@ -326,6 +328,8 @@ word_game_response_map = None                     # normalized dictionary, built
 word_game_dead_ends = None                        # normalized dead-end words
 word_game_start_pool = None                       # easy starts, built lazily
 word_game_validity_cache = {}                     # canonical phrase -> bool semantic verdict
+word_game_dictionary_phrases = set()              # all phrases already present in static data
+unknown_word_phrases = {}                         # missing phrase -> source/verdict/count
 
 
 # ==================== HELPERS ====================
@@ -494,6 +498,80 @@ def load_game_data():
         save_game_data()
 
 
+def save_unknown_word_phrases():
+    temp_path = UNKNOWN_WORDS_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(unknown_word_phrases, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, UNKNOWN_WORDS_FILE)
+    except OSError as exc:
+        log.error("Không save được unknown_word_phrases.json: %s", exc)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def load_unknown_word_phrases():
+    global unknown_word_phrases
+    try:
+        with open(UNKNOWN_WORDS_FILE, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        unknown_word_phrases = raw if isinstance(raw, dict) else {}
+    except FileNotFoundError:
+        unknown_word_phrases = {}
+        save_unknown_word_phrases()
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("unknown_word_phrases.json lỗi, dùng log rỗng: %s", exc)
+        unknown_word_phrases = {}
+
+
+def record_unknown_word_phrase(phrase, source, verdict=None):
+    """Ghi cụm ngoài static dictionary để owner xuất sau đợt test."""
+    ensure_word_game_dictionary()
+    canonical = canonical_word_game_text(phrase)
+    if not canonical or canonical in word_game_dictionary_phrases:
+        return
+    now = int(time.time())
+    entry = unknown_word_phrases.setdefault(canonical, {
+        "phrase": canonical,
+        "sources": [],
+        "verdict": "chưa rõ",
+        "count": 0,
+        "first_seen": now,
+        "last_seen": now,
+    })
+    if source and source not in entry["sources"]:
+        entry["sources"].append(source)
+    if verdict is not None:
+        entry["verdict"] = "hợp lệ" if verdict else "không hợp lệ"
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last_seen"] = now
+    save_unknown_word_phrases()
+
+
+def build_unknown_word_report():
+    lines = [
+        "CÁC CỤM KHÔNG CÓ TRONG TỪ ĐIỂN NỐI TỪ",
+        f"Tổng cộng: {len(unknown_word_phrases)} cụm",
+        "",
+    ]
+    entries = sorted(
+        unknown_word_phrases.values(),
+        key=lambda item: (item.get("verdict") != "hợp lệ", item.get("phrase", "")),
+    )
+    for index, entry in enumerate(entries, 1):
+        sources = ", ".join(entry.get("sources", [])) or "không rõ"
+        lines.append(
+            f"{index}. {entry.get('phrase', '')} | {entry.get('verdict', 'chưa rõ')} "
+            f"| nguồn: {sources} | gặp: {entry.get('count', 1)} lần"
+        )
+    return "\n".join(lines)
+
+
 def get_or_create_game_profile(user):
     user_id = str(user.id)
     profile = game_profiles.get(user_id)
@@ -597,7 +675,7 @@ def parse_word_game_bet(text):
 
 
 def ensure_word_game_dictionary():
-    global word_game_response_map, word_game_dead_ends, word_game_start_pool
+    global word_game_response_map, word_game_dead_ends, word_game_start_pool, word_game_dictionary_phrases
     if word_game_response_map is not None:
         return
     normalized_map = defaultdict(list)
@@ -607,6 +685,15 @@ def ensure_word_game_dictionary():
             if len(canonical_word_game_text(phrase).split()) == 2:
                 normalized_map[normalized_key].append(phrase)
     word_game_response_map = dict(normalized_map)
+    word_game_dictionary_phrases = {
+        canonical_word_game_text(phrase)
+        for phrase in START_PHRASES
+    }
+    word_game_dictionary_phrases.update(
+        canonical_word_game_text(phrase)
+        for phrases in RESPONSE_MAP.values()
+        for phrase in phrases
+    )
     word_game_dead_ends = {canonical_word_game_text(word) for word in DEAD_END_WORDS}
     word_game_start_pool = []
     for phrase in FAIR_WORD_GAME_STARTS:
@@ -698,16 +785,20 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
     return validate_ai_word_response(answer, last_word, used_phrases, used_required_words)
 
 
-async def judge_word_game_phrase(phrase):
+async def judge_word_game_phrase(phrase, source="không rõ"):
     """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau."""
     canonical = canonical_word_game_text(phrase)
     if canonical in word_game_validity_cache:
-        return word_game_validity_cache[canonical]
+        valid = word_game_validity_cache[canonical]
+        record_unknown_word_phrase(canonical, source, valid)
+        return valid
     if canonical in WORD_GAME_ALWAYS_VALID:
         word_game_validity_cache[canonical] = True
+        record_unknown_word_phrase(canonical, source, True)
         return True
     if canonical in WORD_GAME_ALWAYS_INVALID:
         word_game_validity_cache[canonical] = False
+        record_unknown_word_phrase(canonical, source, False)
         return False
     if canonical in {canonical_word_game_text(item) for item in FAIR_WORD_GAME_STARTS}:
         word_game_validity_cache[canonical] = True
@@ -728,6 +819,7 @@ async def judge_word_game_phrase(phrase):
         verdict = await _claude(messages, max_tokens=8, temperature=0, thinking_budget=0)
     except Exception as exc:
         log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
+        record_unknown_word_phrase(canonical, source)
         return None
     if re.fullmatch(r"\s*VALID[.!]?\s*", verdict, re.IGNORECASE):
         valid = True
@@ -750,16 +842,20 @@ async def judge_word_game_phrase(phrase):
         try:
             recheck = await _claude(recheck_messages, max_tokens=8, temperature=0, thinking_budget=0)
         except Exception:
+            record_unknown_word_phrase(canonical, source)
             return None
         if re.fullmatch(r"\s*VALID[.!]?\s*", recheck, re.IGNORECASE):
             valid = True
         elif re.fullmatch(r"\s*INVALID[.!]?\s*", recheck, re.IGNORECASE):
             valid = False
         else:
+            record_unknown_word_phrase(canonical, source)
             return None
     else:
+        record_unknown_word_phrase(canonical, source)
         return None
     word_game_validity_cache[canonical] = valid
+    record_unknown_word_phrase(canonical, source, valid)
     return valid
 
 
@@ -774,13 +870,13 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
         )
         if candidate is None:
             break
-        verdict = await judge_word_game_phrase(candidate)
+        verdict = await judge_word_game_phrase(candidate, source="bot kiểm tra từ điển")
         if verdict is True:
             return candidate
         rejected.add(canonical_word_game_text(candidate))
 
     candidate = await ai_word_game_fallback(last_word, used_phrases, used_required_words)
-    if candidate and await judge_word_game_phrase(candidate) is True:
+    if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is True:
         return candidate
     return None
 
@@ -905,7 +1001,7 @@ async def handle_word_game_session(message, prompt, session):
     if words[-1] in used_required_words:
         await finish_word_game_loss(message, session, f'từ "{words[-1]}" đã nối qua rồi, không quay vòng')
         return
-    semantic_verdict = await judge_word_game_phrase(phrase_key)
+    semantic_verdict = await judge_word_game_phrase(phrase_key, source="người chơi")
     if semantic_verdict is False:
         await send_reply(
             message,
@@ -2054,6 +2150,29 @@ async def slash_reset(interaction: discord.Interaction):
     await interaction.response.send_message("xoá não xong, m là ai t đếch nhớ")
 
 
+@bot.tree.command(
+    name="cactukotrongtudien",
+    description="Xuất các cụm nối từ ngoài từ điển (chỉ chủ bot)",
+)
+async def slash_unknown_word_phrases(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
+        return
+    if not unknown_word_phrases:
+        await interaction.response.send_message("chưa ghi nhận cụm nào ngoài từ điển", ephemeral=True)
+        return
+    report = build_unknown_word_report().encode("utf-8")
+    attachment = discord.File(
+        io.BytesIO(report),
+        filename="cac_tu_khong_trong_tu_dien.txt",
+    )
+    await interaction.response.send_message(
+        f"đã xuất {len(unknown_word_phrases)} cụm, copy file này gửi lại cho t",
+        file=attachment,
+        ephemeral=True,
+    )
+
+
 def build_help_text():
     return (
         "**Lệnh Zun:**\n"
@@ -2148,5 +2267,6 @@ if not ANTHROPIC_API_KEY:
     raise SystemExit("Thiếu ANTHROPIC_API_KEY (hoặc CLAUDE_API_KEY) trong .env")
 
 load_game_data()
+load_unknown_word_phrases()
 start_keepalive_server()
 bot.run(DISCORD_TOKEN)

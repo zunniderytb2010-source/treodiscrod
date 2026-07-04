@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 game_data.json
 game_data.json.tmp
+unknown_word_phrases.json
+unknown_word_phrases.json.tmp
