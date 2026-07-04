@@ -1843,6 +1843,197 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
         return False
 
 
+# ==================== ZUN OS ====================
+ZUN_OS_TIMEOUT_SECONDS = 30
+ZUN_OS_VERSION = "zun os v1.0"
+ZUN_OS_TZ = datetime.timezone(datetime.timedelta(hours=7))
+ZUN_OS_OPEN_RE = re.compile(r"(?:(?:e|alo)\s+)?(?:zun\w*\s+)?mo may")
+
+
+class ZunOSView(discord.ui.View):
+    """Máy tính ảo: 1 embed + button, mọi app edit tại chỗ, 30s không bấm là sập nguồn.
+
+    discord.py tự reset đồng hồ timeout mỗi lần bấm nút hợp lệ nên không cần tự đếm.
+    """
+
+    def __init__(self, owner, gid):
+        super().__init__(timeout=ZUN_OS_TIMEOUT_SECONDS)
+        self.owner = owner
+        self.gid = gid
+        self.message = None
+        self.booted_at = time.time()
+        self.battery = random.randint(37, 98)
+        self.show_home_buttons()
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner.id:
+            await interaction.response.send_message("máy này không phải của m", ephemeral=True)
+            return False
+        return True
+
+    # ---- dựng màn hình ----
+    def _status_bar(self):
+        now = datetime.datetime.now(ZUN_OS_TZ).strftime("%H:%M:%S")
+        uptime = int(time.time() - self.booted_at)
+        battery = max(5, self.battery - uptime // 30)
+        return f"🕒 {now} · 🔋 pin {battery}% · ⏱ bật được {uptime}s"
+
+    @staticmethod
+    def _frame(body):
+        return f"```\n{body}\n```"
+
+    def _apply_footer(self, embed):
+        embed.add_field(name="trạng thái", value=self._status_bar(), inline=False)
+        embed.set_footer(text=f"{ZUN_OS_VERSION} · auto shutdown: {ZUN_OS_TIMEOUT_SECONDS}s")
+        return embed
+
+    def build_home_embed(self):
+        embed = discord.Embed(
+            title="🖥️ ZUN OS",
+            description=(
+                self._frame(
+                    "┌──────────────────────────┐\n"
+                    "│     🟢 MÁY ĐANG BẬT      │\n"
+                    "└──────────────────────────┘"
+                )
+                + f"\ndesktop của **{self.owner.display_name}** — chọn app để mở"
+            ),
+            color=0x57F287,
+        )
+        return self._apply_footer(embed)
+
+    def build_off_embed(self, reason):
+        embed = discord.Embed(
+            title="🖥️ ZUN OS",
+            description=(
+                self._frame(
+                    "┌──────────────────────────┐\n"
+                    "│      ⚫ MÁY ĐÃ TẮT       │\n"
+                    "└──────────────────────────┘"
+                )
+                + f"\n{reason}"
+            ),
+            color=0xED4245,
+        )
+        embed.set_footer(text=f"{ZUN_OS_VERSION} · nhắn 'mở máy' để bật lại")
+        return embed
+
+    def build_app_embed(self, app):
+        embed = discord.Embed(title="🖥️ ZUN OS", color=0x5865F2)
+        if app == "profile":
+            profile = game_profile_for(self.owner)
+            if profile is None:
+                body = "chưa có tài khoản game\nping t rồi nói: tạo tài khoản"
+            else:
+                profile["level"] = 1 + profile["wins"] // 5
+                total = profile["wins"] + profile["losses"]
+                rate = 0 if total == 0 else profile["wins"] / total * 100
+                body = (
+                    f"user : {profile['name']}\n"
+                    f"level: {profile['level']}\n"
+                    f"win  : {profile['wins']}\n"
+                    f"lose : {profile['losses']}\n"
+                    f"rate : {rate:.0f}%"
+                )
+            embed.add_field(name="👤 Profile", value=self._frame(body), inline=False)
+        elif app == "wallet":
+            profile = game_profile_for(self.owner)
+            balance = profile["balance"] if profile else 0
+            body = (
+                f"số dư: {balance:,}đ\n"
+                "──────────────────────\n"
+                "/trade   chuyển tiền\n"
+                "nối từ   thắng ăn x2"
+            )
+            embed.add_field(name="💰 Ví tiền", value=self._frame(body), inline=False)
+        elif app == "game":
+            body = (
+                "NỐI TỪ CƯỢC TIỀN\n"
+                "──────────────────────\n"
+                "mở ván : nhắn 'nối từ'\n"
+                "luật   : 2 từ, nối chữ cuối\n"
+                "10 giây mỗi lượt\n"
+                "sai 4 lần trong ván là thua"
+            )
+            embed.add_field(name="🎮 Mini game", value=self._frame(body), inline=False)
+        elif app == "help":
+            embed.add_field(name="📖 Help", value=build_help_text()[:1024], inline=False)
+        elif app == "settings":
+            body = (
+                f"mood server: {guild_mood.get(self.gid, 'normal')}\n"
+                f"ping       : {round(bot.latency * 1000)}ms\n"
+                f"os         : {ZUN_OS_VERSION}\n"
+                "đổi mood   : /mood (admin)"
+            )
+            embed.add_field(name="⚙️ Cài đặt", value=self._frame(body), inline=False)
+        return self._apply_footer(embed)
+
+    # ---- nút ----
+    def _add_button(self, emoji, label, style, row, handler):
+        button = discord.ui.Button(emoji=emoji, label=label, style=style, row=row)
+
+        async def callback(interaction):
+            await handler(interaction)
+
+        button.callback = callback
+        self.add_item(button)
+
+    def show_home_buttons(self):
+        self.clear_items()
+        primary, secondary = discord.ButtonStyle.primary, discord.ButtonStyle.secondary
+        self._add_button("👤", "Profile", primary, 0, lambda i: self.open_app(i, "profile"))
+        self._add_button("🎮", "Mini game", primary, 0, lambda i: self.open_app(i, "game"))
+        self._add_button("💰", "Ví tiền", primary, 0, lambda i: self.open_app(i, "wallet"))
+        self._add_button("📖", "Help", secondary, 1, lambda i: self.open_app(i, "help"))
+        self._add_button("⚙️", "Cài đặt", secondary, 1, lambda i: self.open_app(i, "settings"))
+        self._add_button("❌", "Tắt máy", discord.ButtonStyle.danger, 1, self.shutdown)
+
+    def show_app_buttons(self):
+        self.clear_items()
+        self._add_button("🏠", "Màn hình chính", discord.ButtonStyle.secondary, 0, self.go_home)
+        self._add_button("❌", "Tắt máy", discord.ButtonStyle.danger, 0, self.shutdown)
+
+    # ---- hành vi ----
+    async def open_app(self, interaction, app):
+        self.show_app_buttons()
+        await interaction.response.edit_message(embed=self.build_app_embed(app), view=self)
+
+    async def go_home(self, interaction):
+        self.show_home_buttons()
+        await interaction.response.edit_message(embed=self.build_home_embed(), view=self)
+
+    async def shutdown(self, interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            embed=self.build_off_embed("hẹn gặp lại"), view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    embed=self.build_off_embed(
+                        f"không ai bấm gì {ZUN_OS_TIMEOUT_SECONDS} giây nên t tắt cho đỡ tốn điện"
+                    ),
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+
+async def open_zun_os(message):
+    view = ZunOSView(message.author, get_gid(message))
+    view.message = await message.reply(
+        embed=view.build_home_embed(),
+        view=view,
+        mention_author=False,
+    )
+
+
 def _split_text_piece(text, limit, preserve_code=False):
     """Chia tại newline trước; không làm mất indentation của code."""
     pieces = []
@@ -2656,9 +2847,10 @@ async def on_message(message):
                 pass
     reply_to_bot = bool(ref and bot.user and ref.author.id == bot.user.id)
 
+    is_open_pc = bool(ZUN_OS_OPEN_RE.fullmatch(normalize_word_game_text(content)))
     if not (
         is_ask or mentioned or wake or reply_to_bot or prefix_moderation
-        or text_economy_command or has_game_session
+        or text_economy_command or has_game_session or is_open_pc
     ):
         return
 
@@ -2673,6 +2865,11 @@ async def on_message(message):
         return
     invoked = is_ask or mentioned or wake or reply_to_bot
     if await handle_word_game_intents(message, prompt, invoked, ref):
+        return
+
+    # Zun OS: máy tính ảo bằng embed + button, ưu tiên sau game để không phá ván.
+    if is_open_pc:
+        await open_zun_os(message)
         return
 
     # ---- roast bằng ngôn ngữ tự nhiên: "zun roast @user", "ê zun khịa @user" ----
@@ -2974,6 +3171,7 @@ def build_help_text():
         "`Zun tạo tài khoản` mở profile game\n"
         "`Zun profile` xem tiền/thắng thua\n"
         "`Zun chơi nối từ` chơi nối từ đặt cược\n"
+        "`mở máy` bật máy tính ảo Zun OS\n"
         "`/trade` chuyển tiền cho profile khác\n"
         "`/naptien` nạp tiền tùy ý, chỉ owner\n"
         "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
