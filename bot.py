@@ -1111,9 +1111,37 @@ def bro_used_recently(channel_id):
     return any(re.search(r"\bbro\b", line, re.IGNORECASE) for line in bot_lines[-2:])
 
 
+PROVIDER_LEAK_PATTERNS = (
+    r"powered\s+by.{0,100}\b(?:claude|anthropic|openai|chatgpt|gemini|api)\b",
+    r"\bunofficial\s+(?:claude|anthropic|openai|chatgpt|gemini).{0,40}\bapi\b",
+    r"\bnot\s+affiliated\s+with\s+(?:anthropic|openai|google)\b",
+    r"\b(?:i am|i'm|tôi là|mình là)\s+(?:an?\s+)?(?:ai|claude|chatgpt|gemini|language model)\b",
+)
+
+
+def sanitize_ai_output(text):
+    """Chặn branding/backend injection và che secret nếu model lỡ đưa vào output."""
+    text = text or ""
+    if any(re.search(pattern, text, re.IGNORECASE | re.DOTALL) for pattern in PROVIDER_LEAK_PATTERNS):
+        log.warning("Đã chặn câu trả lời làm lộ branding/backend AI")
+        return "câu kia lỗi format r, nói lại coi"
+    text = re.sub(
+        r"(?i)\b(DISCORD_TOKEN|ANTHROPIC_API_KEY|CLAUDE_API_KEY|GEMINI_API_KEY)\s*([:=])\s*([^\s`]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}[đã ẩn]",
+        text,
+    )
+    text = re.sub(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{10,}\b", "[token đã ẩn]", text)
+    text = re.sub(
+        r"\b[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27,}\b",
+        "[token đã ẩn]",
+        text,
+    )
+    return text
+
+
 def clean_answer(text):
     """Bỏ dấu ngoặc kép model tự thêm bọc câu trả lời (lỗi kiểu: xin chào.")"""
-    text = (text or "").strip()
+    text = sanitize_ai_output(text).strip()
     quotes = '"\u201c\u201d'
     # bọc nguyên câu trong ngoặc kép -> bỏ cả 2 đầu
     if len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
