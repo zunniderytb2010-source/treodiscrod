@@ -74,7 +74,6 @@ SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
 WORD_GAME_FREEZE_SECONDS = 20
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
-WORD_GAME_COUNT_EMOJIS = [f"{digit}️⃣" for digit in "0123456789"] + ["\U0001F51F"]
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
 WORD_GAME_BLOCKED_OPENING_WORDS = {"bánh"}
@@ -120,8 +119,8 @@ WORD_GAME_ALWAYS_INVALID = {
 WORD_GAME_BOT_AVOID_PHRASES = {
     "chì lưới", "thép nguội", "nát đời",
 }
-# Từ đuôi gần như không có đường nối chuẩn: bot cấm ra, khỏi gài chết người chơi.
-WORD_GAME_NO_EXIT_WORDS = {
+# Từ đuôi gần như không có đường nối chuẩn: nước gài chết, bot ƯU TIÊN ra để ép thua.
+WORD_GAME_KILL_WORDS = {
     "ngoằng", "lự",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
@@ -849,32 +848,27 @@ async def resume_frozen_word_games():
 
 
 async def unfreeze_word_game(channel, key, session):
-    """Đếm 20 giây đóng băng bằng emoji (2 giây/số) rồi mở lại ván."""
+    """Đếm 20 giây đóng băng bằng cách edit số cuối tin nhắn rồi mở lại ván."""
     mentions = discord.AllowedMentions(everyone=False, roles=False, users=True)
     mention = f"<@{key[1]}>"
+    freeze_base = f"{mention} t vừa update xong, ván nối từ đóng băng..."
     try:
         msg = await channel.send(
-            f"{mention} t vừa update xong, ván nối từ đóng băng {WORD_GAME_FREEZE_SECONDS} giây rồi chạy tiếp",
+            f"{freeze_base} {WORD_GAME_FREEZE_SECONDS}",
             allowed_mentions=mentions,
         )
         record_word_game_message(session, msg)
-        step_delay = WORD_GAME_FREEZE_SECONDS / 10
         start = time.monotonic()
-        previous = None
-        for step in range(10, -1, -1):
-            delay = start + (10 - step) * step_delay - time.monotonic()
+        for remaining in range(WORD_GAME_FREEZE_SECONDS - 1, -1, -1):
+            delay = start + (WORD_GAME_FREEZE_SECONDS - remaining) - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
             if word_game_sessions.get(key) is not session:
                 return
-            emoji = WORD_GAME_COUNT_EMOJIS[step]
             try:
-                if previous is not None:
-                    await msg.remove_reaction(previous, bot.user)
-                await msg.add_reaction(emoji)
+                await msg.edit(content=f"{freeze_base} {remaining}")
             except discord.HTTPException:
                 pass
-            previous = emoji
         async with word_game_locks[key]:
             if word_game_sessions.get(key) is not session:
                 return
@@ -884,8 +878,7 @@ async def unfreeze_word_game(channel, key, session):
                 remaining = session.get("turn_remaining")
                 remaining = max(1, min(WORD_GAME_TURN_SECONDS, int(remaining or WORD_GAME_TURN_SECONDS)))
                 sent = await channel.send(
-                    f"{mention} ván chạy tiếp, m nối từ bắt đầu bằng: {session['last_word']}\n"
-                    f"lượt này còn {remaining} giây",
+                    f"{mention} ván chạy tiếp: {session['current_phrase']}... {remaining}",
                     allowed_mentions=mentions,
                 )
                 record_word_game_message(session, sent)
@@ -1231,16 +1224,16 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             and not reverses_used_phrase(normalized, used_phrases)
             and not any(word in WORD_GAME_BANNED_WORDS for word in words)
             and normalized not in WORD_GAME_BOT_AVOID_PHRASES
-            and words[-1] not in WORD_GAME_NO_EXIT_WORDS
         ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
     # RESPONSE_MAP xếp cụm tự nhiên trước, phần sinh tự động nằm sau nên chỉ quét
-    # nhóm đầu. Câu mở màn đã lọc dễ riêng; còn trong ván thì bot chơi khó:
-    # ưu tiên câu có từ cuối cụt để ép người chơi bí.
+    # nhóm đầu. Câu mở màn đã lọc dễ riêng; còn trong ván bot chơi độ khó max:
+    # ưu tiên nước gài chết (từ cuối tuyệt đường), rồi tới từ cuối cụt thường.
     candidates = candidates[:4]
-    deadly = [item for item in candidates if item[2] in word_game_dead_ends]
+    killers = [item for item in candidates if item[2] in WORD_GAME_KILL_WORDS]
+    deadly = killers or [item for item in candidates if item[2] in word_game_dead_ends]
     pool = deadly or candidates
     natural = [item for item in pool if item[2] not in WORD_GAME_FILLER_WORDS]
     return random.choice(natural or pool)[0]
@@ -1261,7 +1254,6 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
         or reverses_used_phrase(normalized, used_phrases)
         or any(word in WORD_GAME_BANNED_WORDS for word in words)
         or normalized in WORD_GAME_BOT_AVOID_PHRASES
-        or words[-1] in WORD_GAME_NO_EXIT_WORDS
     ):
         return None
     return re.sub(r"\s+", " ", answer).strip().lower()
@@ -1275,8 +1267,8 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
         f"Không dùng các cụm đã dùng: {used}.\n"
         "Cụm phải là từ ghép chuẩn, phổ biến với người Việt. KHÔNG dùng tên riêng/địa danh, "
         "KHÔNG ghép gượng kiểu ty con, chì lưới, rãi rác.\n"
-        "Ưu tiên cụm có TỪ CUỐI hiếm, khó nối tiếp để làm khó đối thủ, "
-        "nhưng từ cuối đó vẫn phải còn ít nhất một cách nối chuẩn.\n"
+        "Ưu tiên tối đa cụm có TỪ CUỐI hiểm, càng khó nối tiếp càng tốt, "
+        "kể cả gần như không có đường nối, để ép đối thủ thua.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
     messages = [
@@ -1532,9 +1524,11 @@ def start_word_game_timer(key, session, bot_message, seconds=WORD_GAME_TURN_SECO
 
 
 async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=WORD_GAME_TURN_SECONDS):
-    """Thả emoji đếm seconds -> 0 trên tin của bot; về 0 mà chưa nối thì xử thua luôn."""
+    """Đếm ngược bằng cách edit số cuối tin nhắn (thêu thùa... 10 -> 9 -> ... -> 0);
+    về 0 mà chưa nối thì xử thua luôn."""
+    # Nội dung gốc đã kết thúc bằng số giây; tách phần chữ để edit số đếm.
+    base = re.sub(r"\s*\d+\s*$", "", bot_message.content or "")
     start = time.monotonic()
-    previous = None
     try:
         for remaining in range(seconds, -1, -1):
             delay = start + (seconds - remaining) - time.monotonic()
@@ -1548,15 +1542,11 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=W
                 return
             session["turn_remaining"] = remaining
             save_word_game_sessions()
-            emoji = WORD_GAME_COUNT_EMOJIS[remaining]
-            # Gỡ emoji cũ TRƯỚC rồi mới thả emoji mới để không hiện 2 số cùng lúc.
-            try:
-                if previous is not None:
-                    await bot_message.remove_reaction(previous, bot.user)
-                await bot_message.add_reaction(emoji)
-            except discord.HTTPException:
-                pass
-            previous = emoji
+            if remaining != seconds:  # tin gửi ra đã hiện sẵn số đầu
+                try:
+                    await bot_message.edit(content=f"{base} {remaining}")
+                except discord.HTTPException:
+                    pass
         async with word_game_locks[key]:
             if (
                 word_game_sessions.get(key) is not session
@@ -1602,7 +1592,9 @@ async def register_word_game_strike(message, session, phrase_key, profane=False)
     else:
         text = "??"
     session["updated_at"] = time.time()
-    sent = await send_word_game_reply(message, session, text)
+    sent = await send_word_game_reply(
+        message, session, f"{text}... {WORD_GAME_TURN_SECONDS}",
+    )
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
 
@@ -1705,9 +1697,9 @@ async def handle_word_game_session(message, prompt, session):
         sent = await send_word_game_reply(
             message,
             session,
-            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hoặc đảo cụm cũ\n"
-            f"mỗi lượt m có 10 giây, sai từ 4 lần trong ván là thua\n"
-            f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
+            f"ok cược {bet:,}đ · đúng 2 từ, nối chữ cuối, không lặp/đảo, "
+            f"sai 4 lần thua, {WORD_GAME_TURN_SECONDS} giây mỗi lượt\n"
+            f"{start_phrase}... {WORD_GAME_TURN_SECONDS}",
         )
         start_word_game_timer((message.channel.id, message.author.id), session, sent)
         return
@@ -1762,7 +1754,7 @@ async def handle_word_game_session(message, prompt, session):
     sent = await send_word_game_reply(
         message,
         session,
-        f"hợp lệ\nt nối: {response}\nm nối tiếp bằng: {response_words[-1]}",
+        f"{response}... {WORD_GAME_TURN_SECONDS}",
     )
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
