@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import json
 import logging
 import os
 import random
@@ -16,6 +17,7 @@ from anthropic import AsyncAnthropic
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from word_game_data import DEAD_END_WORDS, RESPONSE_MAP, START_PHRASES
 
 # ==================== CONFIG ====================
 load_dotenv()
@@ -52,6 +54,19 @@ IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
     ".gif": "image/gif",
     ".webp": "image/webp",
+}
+GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_data.json")
+WORD_GAME_TIMEOUT_SECONDS = 5 * 60
+WORD_GAME_START_BALANCE = 10_000
+WORD_GAME_MAX_AI_USED = 80
+
+ACCOUNT_CONTEXT_BLOCKLIST = {
+    "google", "gmail", "youtube", "yt", "facebook", "fb", "tiktok",
+    "discord", "roblox", "steam", "epic", "riot", "valorant", "lol",
+    "garena", "claude", "chatgpt", "openai", "gemini", "anthropic",
+    "github", "gitlab", "twitter", "x", "instagram", "ig", "capcut",
+    "canva", "paypal", "mbbank", "mb bank", "agribank", "momo",
+    "zalopay", "shopee", "lazada",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -284,6 +299,11 @@ last_quick_call = {}                              # (channel_id, user_id) -> tim
 thinking_guilds = set()                           # guild/channel ids where owner enabled thinking
 bot_analyses = {}                                 # (guild_id, bot_id) -> saved analysis
 latest_bot_analysis = {}                          # guild_id -> bot_id
+game_profiles = {}                                # discord user id string -> profile
+word_game_sessions = {}                           # (channel_id, user_id) -> session
+word_game_response_map = None                     # normalized dictionary, built lazily
+word_game_dead_ends = None                        # normalized dead-end words
+word_game_start_pool = None                       # easy starts, built lazily
 
 
 # ==================== HELPERS ====================
@@ -378,6 +398,428 @@ async def run_owner_moderation(message, action, prompt):
 def build_system(gid):
     mood = guild_mood.get(gid, "normal")
     return BASE_PERSONA + "\n\n" + MOOD_PROMPTS[mood]
+
+
+# ==================== PROFILE + NỐI TỪ ====================
+def normalize_word_game_text(text):
+    """Normalize riêng cho nối từ: bỏ dấu, đổi đ -> d và bỏ punctuation."""
+    text = (text or "").lower().replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def save_game_data():
+    """Ghi file tạm rồi replace để hạn chế JSON bị dở khi process tắt ngang."""
+    temp_path = GAME_DATA_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(game_profiles, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, GAME_DATA_FILE)
+    except OSError as exc:
+        log.error("Không save được game_data.json: %s", exc)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def load_game_data():
+    """Load profile; file thiếu/hỏng thì dùng dữ liệu rỗng, không làm bot crash."""
+    global game_profiles
+    try:
+        with open(GAME_DATA_FILE, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if not isinstance(raw, dict):
+            raise ValueError("game_data.json root must be an object")
+        cleaned = {}
+        for user_id, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                wins = max(0, int(value.get("wins", 0)))
+                losses = max(0, int(value.get("losses", 0)))
+                cleaned[str(user_id)] = {
+                    "user_id": str(user_id),
+                    "name": str(value.get("name") or "Unknown")[:100],
+                    "balance": max(0, int(value.get("balance", WORD_GAME_START_BALANCE))),
+                    "level": 1 + wins // 5,
+                    "wins": wins,
+                    "losses": losses,
+                    "created_at": int(value.get("created_at", time.time())),
+                }
+            except (TypeError, ValueError, OverflowError):
+                continue
+        game_profiles = cleaned
+        log.info("Đã load %s profile game", len(game_profiles))
+    except FileNotFoundError:
+        game_profiles = {}
+        save_game_data()
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        log.warning("game_data.json lỗi, dùng data rỗng: %s", exc)
+        game_profiles = {}
+        save_game_data()
+
+
+def get_or_create_game_profile(user):
+    user_id = str(user.id)
+    profile = game_profiles.get(user_id)
+    created = profile is None
+    if created:
+        profile = {
+            "user_id": user_id,
+            "name": user.display_name,
+            "balance": WORD_GAME_START_BALANCE,
+            "level": 1,
+            "wins": 0,
+            "losses": 0,
+            "created_at": int(time.time()),
+        }
+        game_profiles[user_id] = profile
+        save_game_data()
+    elif profile.get("name") != user.display_name:
+        profile["name"] = user.display_name
+        save_game_data()
+    return profile, created
+
+
+def game_profile_for(user):
+    return game_profiles.get(str(user.id))
+
+
+def format_game_profile(profile, heading=None):
+    profile["level"] = 1 + profile["wins"] // 5
+    total = profile["wins"] + profile["losses"]
+    rate = 0 if total == 0 else profile["wins"] / total * 100
+    rate_text = f"{rate:.1f}".rstrip("0").rstrip(".")
+    title = heading or f"profile của {profile['name']}"
+    return (
+        f"{title}\nlv.{profile['level']}\n"
+        f"tiền: {profile['balance']:,}đ\n"
+        f"thắng/thua: {profile['wins']}/{profile['losses']}\n"
+        f"tỉ lệ thắng: {rate_text}%"
+    )
+
+
+def contains_blocked_account_context(plain):
+    padded = f" {plain} "
+    return any(f" {item} " in padded for item in ACCOUNT_CONTEXT_BLOCKLIST)
+
+
+def is_create_game_account_request(plain):
+    markers = ("tao tai khoan", "tao acc", "dang ky tai khoan")
+    return any(marker in plain for marker in markers) and not contains_blocked_account_context(plain)
+
+
+def is_game_profile_request(plain):
+    if contains_blocked_account_context(plain):
+        return False
+    return bool(re.fullmatch(
+        r"(?:xem )?(?:profile|ho so|tai khoan)(?: cua (?:t|toi|tao|minh))?"
+        r"|tien cua (?:t|toi|tao|minh)|so du(?: cua (?:t|toi|tao|minh))?",
+        plain,
+    ))
+
+
+def is_word_game_request(plain):
+    return plain == "noi tu" or any(marker in plain for marker in (
+        "choi noi tu", "noi tu khong", "noi tu di", "zun noi tu", "game noi tu",
+    ))
+
+
+def parse_word_game_bet(text):
+    """Hỗ trợ 1000, 1.000, 1000đ, 1k, 1 nghìn, 1tr, 1 triệu."""
+    plain = (text or "").lower().strip().replace("đ", "d")
+    plain = unicodedata.normalize("NFD", plain)
+    plain = "".join(ch for ch in plain if unicodedata.category(ch) != "Mn")
+    plain = re.sub(r"\s+", " ", plain)
+    match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(k|nghin|ngan|tr|trieu|d|dong)?", plain)
+    if not match:
+        return None
+    number, suffix = match.groups()
+    try:
+        if suffix in {"k", "nghin", "ngan", "tr", "trieu"}:
+            multiplier = 1_000 if suffix in {"k", "nghin", "ngan"} else 1_000_000
+            value = float(number.replace(",", ".")) * multiplier
+        else:
+            value = int(number.replace(",", "").replace(".", ""))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return int(value) if value > 0 and value == int(value) else None
+
+
+def ensure_word_game_dictionary():
+    global word_game_response_map, word_game_dead_ends, word_game_start_pool
+    if word_game_response_map is not None:
+        return
+    normalized_map = defaultdict(list)
+    for key, phrases in RESPONSE_MAP.items():
+        normalized_key = normalize_word_game_text(key)
+        for phrase in phrases:
+            if len(normalize_word_game_text(phrase).split()) == 2:
+                normalized_map[normalized_key].append(phrase)
+    word_game_response_map = dict(normalized_map)
+    word_game_dead_ends = {normalize_word_game_text(word) for word in DEAD_END_WORDS}
+    word_game_start_pool = []
+    for phrase in START_PHRASES:
+        words = normalize_word_game_text(phrase).split()
+        if len(words) == 2 and words[-1] not in word_game_dead_ends and words[-1] in word_game_response_map:
+            word_game_start_pool.append(phrase)
+    log.info(
+        "Đã index từ điển nối từ: %s key, %s câu",
+        len(word_game_response_map),
+        sum(len(items) for items in word_game_response_map.values()),
+    )
+
+
+def choose_word_game_start():
+    ensure_word_game_dictionary()
+    return random.choice(word_game_start_pool or START_PHRASES)
+
+
+def choose_dictionary_word_response(last_word, used_phrases):
+    ensure_word_game_dictionary()
+    candidates = []
+    for phrase in word_game_response_map.get(last_word, []):
+        normalized = normalize_word_game_text(phrase)
+        words = normalized.split()
+        if len(words) == 2 and words[0] == last_word and normalized not in used_phrases:
+            candidates.append((phrase, normalized, words[-1]))
+    if not candidates:
+        return None
+    dead_end_candidates = [item for item in candidates if item[2] in word_game_dead_ends]
+    if dead_end_candidates:
+        return random.choice(dead_end_candidates)[0]
+    # Ít câu mở tiếp hơn = khó hơn; random trong nhóm khó nhất để bot đỡ lặp.
+    candidates.sort(key=lambda item: len(word_game_response_map.get(item[2], ())))
+    hardest_score = len(word_game_response_map.get(candidates[0][2], ()))
+    hardest = [item for item in candidates if len(word_game_response_map.get(item[2], ())) == hardest_score]
+    return random.choice(hardest)[0]
+
+
+def validate_ai_word_response(answer, last_word, used_phrases):
+    answer = (answer or "").strip().strip("`*_\"'")
+    if not answer or answer.upper() == "PASS" or len(answer) > 30 or "\n" in answer:
+        return None
+    if not all(ch.isalpha() or ch.isspace() for ch in answer):
+        return None
+    normalized = normalize_word_game_text(answer)
+    words = normalized.split()
+    if len(words) != 2 or words[0] != last_word or normalized in used_phrases:
+        return None
+    return re.sub(r"\s+", " ", answer).strip().lower()
+
+
+async def ai_word_game_fallback(last_word, used_phrases):
+    used = ", ".join(sorted(used_phrases)[:WORD_GAME_MAX_AI_USED])
+    prompt = (
+        "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
+        f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
+        f"Không dùng các cụm đã dùng: {used}.\n"
+        "Ưu tiên cụm có từ cuối khó nối.\n"
+        "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
+    )
+    messages = [
+        {"role": "system", "content": "Chỉ làm nhiệm vụ nối từ, không trò chuyện."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        answer = await _claude(messages, max_tokens=30, temperature=0.2, thinking_budget=0)
+    except Exception as exc:
+        log.warning("AI nối từ fallback lỗi (%s)", type(exc).__name__)
+        return None
+    return validate_ai_word_response(answer, last_word, used_phrases)
+
+
+def update_game_result(profile, won):
+    if won:
+        profile["wins"] += 1
+    else:
+        profile["losses"] += 1
+    profile["level"] = 1 + profile["wins"] // 5
+    save_game_data()
+
+
+async def finish_word_game_win(message, session):
+    key = (message.channel.id, message.author.id)
+    profile = game_profile_for(message.author)
+    prize = session["bet"] * 2
+    profile["balance"] += prize
+    update_game_result(profile, won=True)
+    word_game_sessions.pop(key, None)
+    await send_reply(
+        message,
+        f"t bí từ rồi\nm thắng +{prize:,}đ\nsố dư giờ: {profile['balance']:,}đ",
+        remember=False,
+    )
+
+
+async def finish_word_game_loss(message, session, reason=""):
+    key = (message.channel.id, message.author.id)
+    profile = game_profile_for(message.author)
+    update_game_result(profile, won=False)
+    word_game_sessions.pop(key, None)
+    prefix = f"{reason}\n" if reason else ""
+    await send_reply(
+        message,
+        f"{prefix}m thua mất {session['bet']:,}đ\nsố dư giờ: {profile['balance']:,}đ",
+        remember=False,
+    )
+
+
+async def handle_word_game_session(message, prompt, session):
+    now = time.time()
+    if now - session["updated_at"] > WORD_GAME_TIMEOUT_SECONDS:
+        if session["state"] == "active":
+            await finish_word_game_loss(message, session, "quá 5 phút không nối, xử thua")
+        else:
+            word_game_sessions.pop((message.channel.id, message.author.id), None)
+            await send_reply(message, "hết 5 phút rồi, t hủy kèo cược", remember=False)
+        return
+
+    plain = normalize_word_game_text(prompt)
+    if is_word_game_request(plain):
+        state_text = "đang chờ m đặt cược rồi" if session["state"] == "waiting_bet" else "đang chơi rồi, nối câu hiện tại đi"
+        await send_reply(message, state_text, remember=False)
+        return
+    if plain in {"huy", "dung", "bo cuoc", "chiu"}:
+        if session["state"] == "active":
+            await finish_word_game_loss(message, session, "m bỏ cuộc")
+        else:
+            word_game_sessions.pop((message.channel.id, message.author.id), None)
+            await send_reply(message, "ok hủy kèo", remember=False)
+        return
+
+    profile = game_profile_for(message.author)
+    if session["state"] == "waiting_bet":
+        bet = parse_word_game_bet(prompt)
+        if bet is None or bet > profile["balance"]:
+            await send_reply(
+                message,
+                f"tiền cược phải từ 1đ tới {profile['balance']:,}đ",
+                remember=False,
+            )
+            return
+        profile["balance"] -= bet
+        save_game_data()
+        start_phrase = choose_word_game_start()
+        words = normalize_word_game_text(start_phrase).split()
+        session.update({
+            "state": "active",
+            "bet": bet,
+            "current_phrase": start_phrase,
+            "last_word": words[-1],
+            "used_phrases": {normalize_word_game_text(start_phrase)},
+            "started_at": now,
+            "updated_at": now,
+        })
+        await send_reply(
+            message,
+            f"ok cược {bet:,}đ\nt ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
+            remember=False,
+        )
+        return
+
+    words = plain.split()
+    if len(words) != 2:
+        await finish_word_game_loss(message, session, "sai luật rồi, phải nói đúng 2 từ")
+        return
+    if words[0] != session["last_word"]:
+        await finish_word_game_loss(
+            message,
+            session,
+            f'sai luật rồi, phải bắt đầu bằng "{session["last_word"]}"',
+        )
+        return
+    if plain in session["used_phrases"]:
+        await finish_word_game_loss(message, session, "cụm đó dùng rồi")
+        return
+
+    session["used_phrases"].add(plain)
+    session["current_phrase"] = prompt
+    session["last_word"] = words[-1]
+    session["updated_at"] = now
+
+    response = choose_dictionary_word_response(session["last_word"], session["used_phrases"])
+    if response is None:
+        response = await ai_word_game_fallback(session["last_word"], session["used_phrases"])
+    if response is None:
+        await finish_word_game_win(message, session)
+        return
+
+    response_normalized = normalize_word_game_text(response)
+    response_words = response_normalized.split()
+    session["used_phrases"].add(response_normalized)
+    session["current_phrase"] = response
+    session["last_word"] = response_words[-1]
+    session["updated_at"] = time.time()
+
+    if response_words[-1] in word_game_dead_ends:
+        await finish_word_game_loss(
+            message,
+            session,
+            f't nối: {response}\ntừ "{response_words[-1]}" gần như hết đường nối rồi',
+        )
+        return
+    await send_reply(
+        message,
+        f"hợp lệ\nt nối: {response}\nm nối tiếp bằng: {response_words[-1]}",
+        remember=False,
+    )
+
+
+async def handle_word_game_intents(message, prompt, invoked):
+    """Return True khi profile/game đã xử lý và on_message phải dừng."""
+    key = (message.channel.id, message.author.id)
+    session = word_game_sessions.get(key)
+    if session:
+        await handle_word_game_session(message, prompt, session)
+        return True
+    if not invoked:
+        return False
+
+    plain = normalize_word_game_text(prompt)
+    if is_create_game_account_request(plain):
+        profile, created = get_or_create_game_profile(message.author)
+        heading = "tạo xong tài khoản cho m rồi" if created else "m có tài khoản rồi đây"
+        await send_reply(message, format_game_profile(profile, heading), remember=False)
+        return True
+    if is_game_profile_request(plain):
+        profile = game_profile_for(message.author)
+        if profile is None:
+            await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+        else:
+            await send_reply(message, format_game_profile(profile), remember=False)
+        return True
+    if is_word_game_request(plain):
+        profile = game_profile_for(message.author)
+        if profile is None:
+            await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+            return True
+        if profile["balance"] <= 0:
+            await send_reply(message, "m hết tiền rồi nên chưa đặt cược được", remember=False)
+            return True
+        word_game_sessions[key] = {
+            "state": "waiting_bet",
+            "bet": 0,
+            "current_phrase": "",
+            "last_word": "",
+            "used_phrases": set(),
+            "started_at": time.time(),
+            "updated_at": time.time(),
+        }
+        await send_reply(
+            message,
+            f"đặt bao nhiêu tiền, số dư m có {profile['balance']:,}đ\n"
+            "thắng ăn gấp đôi thua mất cược",
+            remember=False,
+        )
+        return True
+    return False
 
 
 def _split_text_piece(text, limit, preserve_code=False):
@@ -1132,7 +1574,10 @@ async def on_message(message):
 
     content = message.content or ""
     lowered = content.lower()
-    remember_channel_message(message.channel.id, message.author.display_name, content)
+    key = (message.channel.id, message.author.id)
+    has_game_session = key in word_game_sessions
+    if not has_game_session:
+        remember_channel_message(message.channel.id, message.author.display_name, content)
 
     is_ask = bool(re.match(r"^!ask(?:\s|$)", content, re.IGNORECASE))
     mentioned = bot.user in message.mentions
@@ -1152,11 +1597,19 @@ async def on_message(message):
                 pass
     reply_to_bot = bool(ref and bot.user and ref.author.id == bot.user.id)
 
-    if not (is_ask or mentioned or wake or reply_to_bot or prefix_moderation):
+    if not (is_ask or mentioned or wake or reply_to_bot or prefix_moderation or has_game_session):
         return
 
-    key = (message.channel.id, message.author.id)
     gid = get_gid(message)
+
+    # Game bắt cả tin cược/câu nối không ping bot và luôn chạy trước cooldown/roast/AI.
+    if is_ask:
+        prompt = content[5:].strip()
+    else:
+        prompt = extract_prompt(message)
+    invoked = is_ask or mentioned or wake or reply_to_bot
+    if await handle_word_game_intents(message, prompt, invoked):
+        return
 
     # ---- roast bằng ngôn ngữ tự nhiên: "zun roast @user", "ê zun khịa @user" ----
     targets = [u for u in message.mentions if u != bot.user]
@@ -1174,12 +1627,6 @@ async def on_message(message):
                 log.error("Claude request failed in roast (%s)", type(e).__name__)
                 await send_reply(message, claude_discord_error(e))
         return
-
-    # ---- lấy prompt ----
-    if is_ask:
-        prompt = content[5:].strip()
-    else:
-        prompt = extract_prompt(message)
 
     # Quyền nhạy cảm chỉ OWNER_ID: prefix ?mute/?ban hoặc câu tự nhiên "Zun mute/ban @user".
     moderation_action = owner_moderation_action(message, prompt)
@@ -1393,6 +1840,9 @@ async def slash_reset(interaction: discord.Interaction):
 def build_help_text():
     return (
         "**Lệnh Zun:**\n"
+        "`Zun tạo tài khoản` mở profile game\n"
+        "`Zun profile` xem tiền/thắng thua\n"
+        "`Zun chơi nối từ` chơi nối từ đặt cược\n"
         "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
         "`?ban @user [lý do]` ban, chỉ owner\n"
         "`Zun bật/tắt thinking` chỉ owner\n"
@@ -1480,5 +1930,6 @@ if not DISCORD_TOKEN:
 if not ANTHROPIC_API_KEY:
     raise SystemExit("Thiếu ANTHROPIC_API_KEY (hoặc CLAUDE_API_KEY) trong .env")
 
+load_game_data()
 start_keepalive_server()
 bot.run(DISCORD_TOKEN)
