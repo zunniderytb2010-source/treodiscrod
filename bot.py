@@ -7,10 +7,12 @@ import logging
 import os
 import random
 import re
+import signal
 import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
+from types import SimpleNamespace
 
 import anthropic
 import discord
@@ -66,6 +68,10 @@ WORD_GAME_LOG_CHANNEL_NAME = os.getenv("WORD_GAME_LOG_CHANNEL_NAME", "nối-từ
 GAME_BACKUP_INTERVAL_SECONDS = 5 * 60
 GAME_BACKUP_FILENAME = "game_data_backup.json"
 UNKNOWN_BACKUP_FILENAME = "unknown_words_backup.json"
+# Ván đang chơi cũng phải sống qua update: lưu session + đóng băng rồi chạy tiếp.
+WORD_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "word_game_sessions.json")
+SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
+WORD_GAME_FREEZE_SECONDS = 20
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_COUNT_EMOJIS = [f"{digit}️⃣" for digit in "0123456789"] + ["\U0001F51F"]
@@ -602,6 +608,10 @@ def _build_backup_files():
             io.BytesIO(json.dumps(unknown_word_phrases, ensure_ascii=False, indent=2).encode("utf-8")),
             filename=UNKNOWN_BACKUP_FILENAME,
         ),
+        discord.File(
+            io.BytesIO(json.dumps(_serialize_word_game_sessions(), ensure_ascii=False, indent=2).encode("utf-8")),
+            filename=SESSIONS_BACKUP_FILENAME,
+        ),
     ]
 
 
@@ -650,7 +660,8 @@ async def restore_game_backup_from_dm():
     global game_profiles, unknown_word_phrases, _backup_message
     need_profiles = not game_profiles
     need_unknown = not unknown_word_phrases
-    if not need_profiles and not need_unknown:
+    need_sessions = not _load_local_session_data()
+    if not need_profiles and not need_unknown and not need_sessions:
         return
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
@@ -682,8 +693,233 @@ async def restore_game_backup_from_dm():
                     unknown_word_phrases = raw
                     save_unknown_word_phrases()
                     log.info("Đã khôi phục %s cụm lạ từ backup DM", len(raw))
+            elif need_sessions and attachment.filename == SESSIONS_BACKUP_FILENAME:
+                try:
+                    raw = json.loads((await attachment.read()).decode("utf-8"))
+                except (json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup ván nối từ trong DM lỗi: %s", exc)
+                    continue
+                if isinstance(raw, dict) and raw:
+                    try:
+                        with open(WORD_SESSIONS_FILE, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, ensure_ascii=False)
+                        log.info("Đã khôi phục %s ván nối từ từ backup DM", len(raw))
+                    except OSError as exc:
+                        log.warning("Không ghi được file ván nối từ: %s", exc)
     except discord.HTTPException as exc:
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
+
+
+# ==================== ĐÓNG BĂNG VÁN QUA UPDATE ====================
+def _serialize_word_game_sessions():
+    data = {}
+    for (channel_id, user_id), session in word_game_sessions.items():
+        messages = []
+        for item in session.get("game_messages", []):
+            author = getattr(item, "author", None)
+            created_at = getattr(item, "created_at", None)
+            messages.append({
+                "id": getattr(item, "id", 0),
+                "content": (getattr(item, "content", "") or "")[:500],
+                "author_name": getattr(author, "display_name", None) or getattr(author, "name", "không rõ"),
+                "author_id": getattr(author, "id", 0),
+                "created_at": created_at.timestamp() if created_at else None,
+            })
+        data[f"{channel_id}:{user_id}"] = {
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "state": session.get("state"),
+            "bet": session.get("bet", 0),
+            "current_phrase": session.get("current_phrase", ""),
+            "last_word": session.get("last_word", ""),
+            "used_phrases": sorted(session.get("used_phrases", set())),
+            "used_required_words": sorted(session.get("used_required_words") or []),
+            "strikes": session.get("strikes", 0),
+            "turn_remaining": session.get("turn_remaining"),
+            "started_at": session.get("started_at"),
+            "game_id": session.get("game_id"),
+            "player_id": session.get("player_id"),
+            "player_name": session.get("player_name"),
+            "guild_name": session.get("guild_name"),
+            "source_channel_name": session.get("source_channel_name"),
+            "messages": messages,
+        }
+    return data
+
+
+def save_word_game_sessions():
+    """Ghi ván đang chơi ra file mỗi khi thay đổi để restart không mất ván."""
+    temp_path = WORD_SESSIONS_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(_serialize_word_game_sessions(), handle, ensure_ascii=False)
+        os.replace(temp_path, WORD_SESSIONS_FILE)
+    except OSError as exc:
+        log.warning("Không save được ván nối từ: %s", exc)
+
+
+def _load_local_session_data():
+    try:
+        with open(WORD_SESSIONS_FILE, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+class RestoredGameMessage:
+    """Tin nhắn của ván trước restart: đủ thông tin cho biên bản và xóa được."""
+
+    def __init__(self, channel, data):
+        self.id = int(data.get("id") or 0)
+        self._channel = channel
+        self.content = data.get("content", "")
+        self.author = SimpleNamespace(
+            display_name=data.get("author_name") or "không rõ",
+            name=data.get("author_name") or "không rõ",
+            id=data.get("author_id") or 0,
+        )
+        ts = data.get("created_at")
+        self.created_at = (
+            datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) if ts else None
+        )
+
+    async def delete(self):
+        await self._channel.get_partial_message(self.id).delete()
+
+
+async def resume_frozen_word_games():
+    """Sau update: dựng lại từng ván, đóng băng 20 giây rồi chạy tiếp đúng chỗ dừng."""
+    data = _load_local_session_data()
+    if not data:
+        return
+    for key_text, item in data.items():
+        try:
+            channel_id = int(item.get("channel_id") or key_text.split(":")[0])
+            user_id = int(item.get("user_id") or key_text.split(":")[1])
+        except (TypeError, ValueError):
+            continue
+        key = (channel_id, user_id)
+        if key in word_game_sessions:
+            continue
+        state = item.get("state")
+        if state not in {"active", "waiting_bet"}:
+            continue
+        if state == "active" and (not item.get("last_word") or game_profiles.get(str(user_id)) is None):
+            continue
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            log.warning("Không mở được kênh %s để resume ván nối từ", channel_id)
+            continue
+        session = {
+            "state": state,
+            "bet": max(0, int(item.get("bet") or 0)),
+            "current_phrase": item.get("current_phrase", ""),
+            "last_word": item.get("last_word", ""),
+            "used_phrases": set(item.get("used_phrases") or []),
+            "used_required_words": set(item.get("used_required_words") or []),
+            "strikes": max(0, int(item.get("strikes") or 0)),
+            "turn_remaining": item.get("turn_remaining"),
+            "started_at": item.get("started_at") or time.time(),
+            "updated_at": time.time(),
+            "frozen": True,
+            "game_id": item.get("game_id"),
+            "player_id": item.get("player_id") or user_id,
+            "player_name": item.get("player_name") or "không rõ",
+            "guild_name": item.get("guild_name") or "không rõ",
+            "source_channel_name": item.get("source_channel_name") or str(channel_id),
+            "game_messages": [RestoredGameMessage(channel, m) for m in item.get("messages") or []],
+        }
+        word_game_sessions[key] = session
+        asyncio.create_task(unfreeze_word_game(channel, key, session))
+    save_word_game_sessions()
+
+
+async def unfreeze_word_game(channel, key, session):
+    """Đếm 20 giây đóng băng bằng emoji (2 giây/số) rồi mở lại ván."""
+    mentions = discord.AllowedMentions(everyone=False, roles=False, users=True)
+    mention = f"<@{key[1]}>"
+    try:
+        msg = await channel.send(
+            f"{mention} t vừa update xong, ván nối từ đóng băng {WORD_GAME_FREEZE_SECONDS} giây rồi chạy tiếp",
+            allowed_mentions=mentions,
+        )
+        record_word_game_message(session, msg)
+        step_delay = WORD_GAME_FREEZE_SECONDS / 10
+        start = time.monotonic()
+        previous = None
+        for step in range(10, -1, -1):
+            delay = start + (10 - step) * step_delay - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if word_game_sessions.get(key) is not session:
+                return
+            emoji = WORD_GAME_COUNT_EMOJIS[step]
+            try:
+                if previous is not None:
+                    await msg.remove_reaction(previous, bot.user)
+                await msg.add_reaction(emoji)
+            except discord.HTTPException:
+                pass
+            previous = emoji
+        async with word_game_locks[key]:
+            if word_game_sessions.get(key) is not session:
+                return
+            session["frozen"] = False
+            session["updated_at"] = time.time()
+            if session["state"] == "active":
+                remaining = session.get("turn_remaining")
+                remaining = max(1, min(WORD_GAME_TURN_SECONDS, int(remaining or WORD_GAME_TURN_SECONDS)))
+                sent = await channel.send(
+                    f"{mention} ván chạy tiếp, m nối từ bắt đầu bằng: {session['last_word']}\n"
+                    f"lượt này còn {remaining} giây",
+                    allowed_mentions=mentions,
+                )
+                record_word_game_message(session, sent)
+                start_word_game_timer(key, session, sent, seconds=remaining)
+            else:
+                sent = await channel.send(
+                    f"{mention} ván chạy tiếp, m đặt bao nhiêu tiền?",
+                    allowed_mentions=mentions,
+                )
+                record_word_game_message(session, sent)
+            save_word_game_sessions()
+    except discord.HTTPException as exc:
+        log.warning("Không resume được ván %s: %s", session.get("game_id"), exc)
+
+
+_shutdown_started = False
+
+
+async def graceful_shutdown():
+    """Render gửi SIGTERM khi redeploy: đóng băng ván, backup rồi mới tắt."""
+    global _shutdown_started
+    if _shutdown_started:
+        return
+    _shutdown_started = True
+    log.info("Nhận tín hiệu tắt: đóng băng %s ván nối từ và backup", len(word_game_sessions))
+    for session in word_game_sessions.values():
+        session["frozen"] = True
+        task = session.pop("timer_task", None)
+        if task is not None:
+            task.cancel()
+    save_word_game_sessions()
+    try:
+        await send_game_backup()
+    finally:
+        await bot.close()
+
+
+def register_shutdown_handlers():
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(graceful_shutdown()))
+        log.info("Đã gắn handler SIGTERM/SIGINT cho shutdown sạch")
+    except (NotImplementedError, RuntimeError):
+        # Windows dev không hỗ trợ add_signal_handler; trên Render (Linux) chạy được.
+        pass
 
 
 def record_unknown_word_phrase(phrase, source, verdict=None):
@@ -1258,24 +1494,29 @@ async def archive_and_cleanup_word_game(session, source_channel, won):
     return True
 
 
-def start_word_game_timer(key, session, bot_message):
-    """Mỗi lần bot ra từ thì đếm 10 giây cho người chơi bằng emoji trên tin đó."""
+def start_word_game_timer(key, session, bot_message, seconds=WORD_GAME_TURN_SECONDS):
+    """Mỗi lần bot ra từ thì đếm giờ cho người chơi bằng emoji trên tin đó.
+
+    seconds cho phép resume đồng hồ đúng chỗ dừng sau khi bot update (vd còn 6s).
+    """
     cancel_word_game_timer(session)
     if bot_message is None:
         return
+    seconds = max(1, min(WORD_GAME_TURN_SECONDS, int(seconds)))
     session["turn_id"] = session.get("turn_id", 0) + 1
+    session["turn_remaining"] = seconds
     session["timer_task"] = asyncio.create_task(
-        word_game_turn_countdown(key, session, session["turn_id"], bot_message)
+        word_game_turn_countdown(key, session, session["turn_id"], bot_message, seconds)
     )
 
 
-async def word_game_turn_countdown(key, session, turn_id, bot_message):
-    """Thả emoji đếm 10 -> 0 trên tin của bot; về 0 mà chưa nối thì xử thua luôn."""
+async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=WORD_GAME_TURN_SECONDS):
+    """Thả emoji đếm seconds -> 0 trên tin của bot; về 0 mà chưa nối thì xử thua luôn."""
     start = time.monotonic()
     previous = None
     try:
-        for remaining in range(WORD_GAME_TURN_SECONDS, -1, -1):
-            delay = start + (WORD_GAME_TURN_SECONDS - remaining) - time.monotonic()
+        for remaining in range(seconds, -1, -1):
+            delay = start + (seconds - remaining) - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
             if (
@@ -1284,11 +1525,14 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message):
                 or session["state"] != "active"
             ):
                 return
+            session["turn_remaining"] = remaining
+            save_word_game_sessions()
             emoji = WORD_GAME_COUNT_EMOJIS[remaining]
+            # Gỡ emoji cũ TRƯỚC rồi mới thả emoji mới để không hiện 2 số cùng lúc.
             try:
-                await bot_message.add_reaction(emoji)
                 if previous is not None:
                     await bot_message.remove_reaction(previous, bot.user)
+                await bot_message.add_reaction(emoji)
             except discord.HTTPException:
                 pass
             previous = emoji
@@ -1301,12 +1545,13 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message):
                 return
             session.pop("timer_task", None)
             word_game_sessions.pop(key, None)
+            save_word_game_sessions()
             profile = game_profiles.get(str(key[1]))
             if profile is None:
                 return
             update_game_result(profile, won=False)
             sent = await bot_message.reply(
-                f"<@{key[1]}> hết 10 giây rồi\nm thua mất {session['bet']:,}đ\n"
+                f"<@{key[1]}> hết {WORD_GAME_TURN_SECONDS} giây rồi\nm thua mất {session['bet']:,}đ\n"
                 f"số dư giờ: {profile['balance']:,}đ",
                 allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
             )
@@ -1373,6 +1618,12 @@ async def finish_word_game_loss(message, session, reason=""):
 
 async def handle_word_game_session(message, prompt, session):
     record_word_game_message(session, message)
+    if session.get("frozen"):
+        # Ván đang đóng băng chờ update xong; không xử lý lượt, không tính giờ.
+        await send_word_game_reply(
+            message, session, "ván đang đóng băng chờ t update xong, đợi đếm xong đã",
+        )
+        return
     now = time.time()
     if now - session["updated_at"] > WORD_GAME_TIMEOUT_SECONDS:
         if session["state"] == "active":
@@ -1506,6 +1757,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
         session = word_game_sessions.get(key)
         if session:
             await handle_word_game_session(message, prompt, session)
+            save_word_game_sessions()
             return True
         if not invoked:
             return False
@@ -1567,6 +1819,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
             }
             word_game_sessions[key] = session
             record_word_game_message(session, message)
+            save_word_game_sessions()
             await send_word_game_reply(
                 message,
                 session,
@@ -2350,7 +2603,9 @@ async def on_ready():
             log.error(f"Lỗi sync slash command: {e}")
     if not _backup_started:
         _backup_started = True
+        register_shutdown_handlers()
         await restore_game_backup_from_dm()
+        await resume_frozen_word_games()
         asyncio.create_task(game_backup_loop())
 
 
