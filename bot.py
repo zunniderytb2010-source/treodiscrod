@@ -319,6 +319,7 @@ word_game_sessions = {}                           # (channel_id, user_id) -> ses
 word_game_response_map = None                     # normalized dictionary, built lazily
 word_game_dead_ends = None                        # normalized dead-end words
 word_game_start_pool = None                       # easy starts, built lazily
+word_game_validity_cache = {}                     # canonical phrase -> bool semantic verdict
 
 
 # ==================== HELPERS ====================
@@ -679,6 +680,56 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
     return validate_ai_word_response(answer, last_word, used_phrases, used_required_words)
 
 
+async def judge_word_game_phrase(phrase):
+    """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau."""
+    canonical = canonical_word_game_text(phrase)
+    if canonical in word_game_validity_cache:
+        return word_game_validity_cache[canonical]
+    if canonical in {canonical_word_game_text(item) for item in FAIR_WORD_GAME_STARTS}:
+        word_game_validity_cache[canonical] = True
+        return True
+    prompt = (
+        "Cụm sau có phải cụm 2 từ tiếng Việt tự nhiên, có nghĩa rõ và được người Việt thực sự dùng không?\n"
+        f"Cụm: {canonical}\n"
+        "Không chấp nhận ghép máy, đảo từ vô nghĩa hoặc hai từ chỉ tình cờ đứng cạnh nhau.\n"
+        "Chỉ trả đúng VALID hoặc INVALID."
+    )
+    messages = [
+        {"role": "system", "content": "Bạn là bộ kiểm định cụm từ tiếng Việt cực nghiêm."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        verdict = await _claude(messages, max_tokens=8, temperature=0, thinking_budget=0)
+    except Exception as exc:
+        log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
+        return None
+    valid = bool(re.fullmatch(r"\s*VALID[.!]?\s*", verdict, re.IGNORECASE))
+    word_game_validity_cache[canonical] = valid
+    return valid
+
+
+async def choose_semantic_word_response(last_word, used_phrases, used_required_words):
+    """Thử tối đa 4 câu dictionary; chỉ trả câu đã qua kiểm nghĩa."""
+    rejected = set()
+    for _ in range(4):
+        candidate = choose_dictionary_word_response(
+            last_word,
+            used_phrases | rejected,
+            used_required_words,
+        )
+        if candidate is None:
+            break
+        verdict = await judge_word_game_phrase(candidate)
+        if verdict is True:
+            return candidate
+        rejected.add(canonical_word_game_text(candidate))
+
+    candidate = await ai_word_game_fallback(last_word, used_phrases, used_required_words)
+    if candidate and await judge_word_game_phrase(candidate) is True:
+        return candidate
+    return None
+
+
 def update_game_result(profile, won):
     if won:
         profile["wins"] += 1
@@ -789,6 +840,10 @@ async def handle_word_game_session(message, prompt, session):
     if words[-1] in used_required_words:
         await finish_word_game_loss(message, session, f'từ "{words[-1]}" đã nối qua rồi, không quay vòng')
         return
+    semantic_verdict = await judge_word_game_phrase(phrase_key)
+    if semantic_verdict is False:
+        await finish_word_game_loss(message, session, f'cụm "{phrase_key}" không có nghĩa hợp lệ')
+        return
 
     session["used_phrases"].add(phrase_key)
     used_required_words.add(words[-1])
@@ -796,13 +851,9 @@ async def handle_word_game_session(message, prompt, session):
     session["last_word"] = words[-1]
     session["updated_at"] = now
 
-    response = choose_dictionary_word_response(
+    response = await choose_semantic_word_response(
         session["last_word"], session["used_phrases"], used_required_words,
     )
-    if response is None:
-        response = await ai_word_game_fallback(
-            session["last_word"], session["used_phrases"], used_required_words,
-        )
     if response is None:
         await finish_word_game_win(message, session)
         return
