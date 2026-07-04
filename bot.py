@@ -39,7 +39,7 @@ MEMORY_MSGS = 60  # 30 luot user + 30 luot bot
 CHUNK_SIZE = 1900  # gioi han Discord 2000 ky tu/tin nhan
 CODE_MAX_TOKENS = 4096
 CHAT_MAX_TOKENS = 600
-CODE_THINKING_BUDGET = 2048  # chi code mode moi bat thinking; chat thuong tat de tra loi nhanh ~2s
+CODE_THINKING_BUDGET = 4096  # chi code mode moi bat thinking; chat thuong tat de tra loi nhanh ~2s
 ALLOWED_EXT = (".txt", ".py", ".js", ".json", ".lua", ".md")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
