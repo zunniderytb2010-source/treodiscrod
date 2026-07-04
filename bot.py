@@ -74,6 +74,12 @@ FAIR_WORD_GAME_STARTS = (
 WORD_GAME_FILLER_WORDS = {
     "bot", "bug", "code", "data", "file", "fix", "game", "key", "lag", "loi",
 }
+WORD_GAME_ALWAYS_VALID = {
+    "ảnh nét", "ngọt lịm", "người ngợm", "nhiếc móc", "túi da", "móc túi", "hình ảnh",
+}
+WORD_GAME_ALWAYS_INVALID = {
+    "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
+}
 
 ACCOUNT_CONTEXT_BLOCKLIST = {
     "google", "gmail", "youtube", "yt", "facebook", "fb", "tiktok",
@@ -697,17 +703,25 @@ async def judge_word_game_phrase(phrase):
     canonical = canonical_word_game_text(phrase)
     if canonical in word_game_validity_cache:
         return word_game_validity_cache[canonical]
+    if canonical in WORD_GAME_ALWAYS_VALID:
+        word_game_validity_cache[canonical] = True
+        return True
+    if canonical in WORD_GAME_ALWAYS_INVALID:
+        word_game_validity_cache[canonical] = False
+        return False
     if canonical in {canonical_word_game_text(item) for item in FAIR_WORD_GAME_STARTS}:
         word_game_validity_cache[canonical] = True
         return True
     prompt = (
-        "Cụm sau có phải cụm 2 từ tiếng Việt tự nhiên, có nghĩa rõ và được người Việt thực sự dùng không?\n"
+        "Kiểm tra một lượt NỐI TỪ tiếng Việt. Cụm hợp lệ khi 2 từ ghép lại tạo ý nghĩa tự nhiên "
+        "mà người Việt hiểu được; KHÔNG bắt buộc là thành ngữ hay cụm từ cố định trong từ điển.\n"
         f"Cụm: {canonical}\n"
-        "Không chấp nhận ghép máy, đảo từ vô nghĩa hoặc hai từ chỉ tình cờ đứng cạnh nhau.\n"
+        "VALID: ảnh nét, túi da, ngọt lịm, người ngợm, nhiếc móc, hình ảnh, móc túi.\n"
+        "INVALID: ngợm nhiếc, đạc đồ, hài bài, ambient kính, hai từ ghép máy không tạo nghĩa.\n"
         "Chỉ trả đúng VALID hoặc INVALID."
     )
     messages = [
-        {"role": "system", "content": "Bạn là bộ kiểm định cụm từ tiếng Việt cực nghiêm."},
+        {"role": "system", "content": "Bạn là giám khảo nối từ tiếng Việt công bằng, hiểu cả văn nói tự nhiên."},
         {"role": "user", "content": prompt},
     ]
     try:
@@ -715,7 +729,36 @@ async def judge_word_game_phrase(phrase):
     except Exception as exc:
         log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
         return None
-    valid = bool(re.fullmatch(r"\s*VALID[.!]?\s*", verdict, re.IGNORECASE))
+    if re.fullmatch(r"\s*VALID[.!]?\s*", verdict, re.IGNORECASE):
+        valid = True
+    elif re.fullmatch(r"\s*INVALID[.!]?\s*", verdict, re.IGNORECASE):
+        # Recheck theo hướng tìm ngữ cảnh hợp lý để giảm false-negative như "ảnh nét".
+        recheck_messages = [
+            {
+                "role": "system",
+                "content": "Bạn là giám khảo nối từ tiếng Việt, ưu tiên không xử oan người chơi.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f'Xét lại cụm "{canonical}". Nếu cụm diễn tả được một ý tự nhiên trong văn nói '
+                    "(kể cả danh từ+tính từ như ảnh nét) thì trả VALID. Chỉ khi thật sự vô nghĩa mới trả INVALID. "
+                    "Chỉ trả đúng một nhãn."
+                ),
+            },
+        ]
+        try:
+            recheck = await _claude(recheck_messages, max_tokens=8, temperature=0, thinking_budget=0)
+        except Exception:
+            return None
+        if re.fullmatch(r"\s*VALID[.!]?\s*", recheck, re.IGNORECASE):
+            valid = True
+        elif re.fullmatch(r"\s*INVALID[.!]?\s*", recheck, re.IGNORECASE):
+            valid = False
+        else:
+            return None
+    else:
+        return None
     word_game_validity_cache[canonical] = valid
     return valid
 
@@ -864,7 +907,12 @@ async def handle_word_game_session(message, prompt, session):
         return
     semantic_verdict = await judge_word_game_phrase(phrase_key)
     if semantic_verdict is False:
-        await finish_word_game_loss(message, session, f'cụm "{phrase_key}" không có nghĩa hợp lệ')
+        await send_reply(
+            message,
+            f'cụm "{phrase_key}" nghe không có nghĩa, đổi cụm khác bắt đầu bằng '
+            f'"{session["last_word"]}"; chưa tính thua',
+            remember=False,
+        )
         return
 
     session["used_phrases"].add(phrase_key)
