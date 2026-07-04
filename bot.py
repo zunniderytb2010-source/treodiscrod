@@ -766,7 +766,7 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
     return re.sub(r"\s+", " ", answer).strip().lower()
 
 
-async def ai_word_game_fallback(last_word, used_phrases, used_required_words=None):
+async def ai_word_game_fallback(last_word, used_phrases, used_required_words=None, temperature=0.2):
     used = ", ".join(sorted(used_phrases)[:WORD_GAME_MAX_AI_USED])
     prompt = (
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
@@ -780,7 +780,7 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
         {"role": "user", "content": prompt},
     ]
     try:
-        answer = await _claude(messages, max_tokens=30, temperature=0.2, thinking_budget=0)
+        answer = await _claude(messages, max_tokens=30, temperature=temperature, thinking_budget=0)
     except Exception as exc:
         log.warning("AI nối từ fallback lỗi (%s)", type(exc).__name__)
         return None
@@ -877,9 +877,13 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
             return candidate
         rejected.add(canonical_word_game_text(candidate))
 
-    candidate = await ai_word_game_fallback(last_word, used_phrases, used_required_words)
-    if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is True:
-        return candidate
+    # AI fallback thử 2 lần, lần 2 tăng temperature để đổi hướng nghĩ.
+    for temperature in (0.2, 0.8):
+        candidate = await ai_word_game_fallback(
+            last_word, used_phrases, used_required_words, temperature=temperature,
+        )
+        if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is True:
+            return candidate
     return None
 
 
