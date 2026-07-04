@@ -91,6 +91,8 @@ WORD_GAME_ALWAYS_VALID = {
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
+    "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
+    "mẻ nồi", "nhóm sản", "trận w",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
