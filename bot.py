@@ -31,6 +31,7 @@ ANTHROPIC_API_KEY = (
 ).strip()
 
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+ROAST_MODEL = os.getenv("ROAST_MODEL", "claude-sonnet-5")  # roast dung model thong minh hon
 MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
@@ -641,12 +642,17 @@ def claude_discord_error(error):
     return random.choice(ERROR_EXCUSES)
 
 
-async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0):
+# Model doi 4.6+ (sonnet-5, opus-4-6...): adaptive thinking tu bat, CAM temperature/budget_tokens.
+NEWGEN_MODEL_PREFIXES = ("claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-fable")
+
+
+async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None):
     """Gọi Anthropic Messages API; SDK tự retry 429/5xx (max_retries mặc định 2).
 
-    thinking_budget > 0 thì bật extended thinking (nghĩ sâu, dùng cho code mode):
-    - budget phải cộng thêm vào max_tokens vì thinking tính chung quota output
-    - API cấm truyền temperature khi thinking bật nên chỉ truyền lúc thinking tắt.
+    Model cũ (Haiku 4.5): thinking_budget > 0 thì bật extended thinking,
+    budget cộng thêm vào max_tokens và không được truyền temperature.
+    Model đời 4.6+ : thinking adaptive tự chạy, API cấm temperature lẫn budget_tokens,
+    thinking_budget chỉ dùng làm chỗ dư trong max_tokens cho phần nghĩ.
     """
     system_parts = []
     claude_messages = []
@@ -656,15 +662,18 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
         else:
             claude_messages.append({"role": m["role"], "content": m["content"]})
 
+    use_model = model or MODEL
     extra = {}
-    if thinking_budget > 0:
+    if use_model.startswith(NEWGEN_MODEL_PREFIXES):
+        max_tokens += thinking_budget
+    elif thinking_budget > 0:
         extra["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
         max_tokens += thinking_budget
     else:
         extra["temperature"] = temperature
 
     resp = await claude.messages.create(
-        model=MODEL,
+        model=use_model,
         max_tokens=max_tokens,
         system="\n\n".join(system_parts),
         messages=claude_messages,
@@ -755,14 +764,14 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
     return answer
 
 
-async def ai_task(gid, task, user_content, max_tokens=400, temperature=0.85, thinking_budget=0):
+async def ai_task(gid, task, user_content, max_tokens=400, temperature=0.85, thinking_budget=0, model=None):
     """Task 1 lần, ko memory (roast, quote, summarize, translate)."""
     system = build_system(gid) + "\n\nNhiệm vụ lần này: " + task
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
-    return await _claude(messages, max_tokens, temperature, thinking_budget)
+    return await _claude(messages, max_tokens, temperature, thinking_budget, model)
 
 
 async def make_roast(gid, target_name, channel_id=None):
@@ -783,7 +792,10 @@ async def make_roast(gid, target_name, channel_id=None):
         "Chỉ trả về đúng câu roast."
     )
     user_content = f"{context}\n\nRoast {target_name} đi" if context else f"Roast {target_name} đi"
-    return await ai_task(gid, task, user_content, max_tokens=200, temperature=1.0, thinking_budget=1024)
+    return await ai_task(
+        gid, task, user_content,
+        max_tokens=300, thinking_budget=2048, model=ROAST_MODEL,
+    )
 
 
 def extract_prompt(message):
