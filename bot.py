@@ -60,8 +60,8 @@ GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_
 UNKNOWN_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unknown_word_phrases.json")
 WORD_GAME_TIMEOUT_SECONDS = 5 * 60
 WORD_GAME_TURN_SECONDS = 10
-# Host redeploy là mất file local, nên định kỳ DM chủ bot bản backup để khôi phục.
-GAME_BACKUP_INTERVAL_SECONDS = 10 * 60
+# Host redeploy là mất file local, nên giữ 1 tin DM chứa backup và edit tại chỗ.
+GAME_BACKUP_INTERVAL_SECONDS = 5 * 60
 GAME_BACKUP_FILENAME = "game_data_backup.json"
 UNKNOWN_BACKUP_FILENAME = "unknown_words_backup.json"
 WORD_GAME_MAX_STRIKES = 4
@@ -555,25 +555,50 @@ def load_unknown_word_phrases():
         unknown_word_phrases = {}
 
 
+_backup_message = None  # tin DM duy nhất chứa backup, edit tại chỗ cho đỡ spam
+
+
+def _build_backup_files():
+    return [
+        discord.File(
+            io.BytesIO(json.dumps(game_profiles, ensure_ascii=False, indent=2).encode("utf-8")),
+            filename=GAME_BACKUP_FILENAME,
+        ),
+        discord.File(
+            io.BytesIO(json.dumps(unknown_word_phrases, ensure_ascii=False, indent=2).encode("utf-8")),
+            filename=UNKNOWN_BACKUP_FILENAME,
+        ),
+    ]
+
+
+async def _find_backup_message(dm):
+    async for message in dm.history(limit=100):
+        if (
+            bot.user
+            and message.author.id == bot.user.id
+            and any(a.filename == GAME_BACKUP_FILENAME for a in message.attachments)
+        ):
+            return message
+    return None
+
+
 async def send_game_backup():
-    """DM chủ bot file backup để dữ liệu game sống qua các lần host redeploy."""
-    global _game_backup_dirty
+    """Giữ đúng 1 tin DM chứa backup, data đổi thì edit tại chỗ thay vì gửi tin mới."""
+    global _game_backup_dirty, _backup_message
+    content = f"backup game tự động, đừng xoá tin này; cập nhật <t:{int(time.time())}:R>"
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
-        files = [
-            discord.File(
-                io.BytesIO(json.dumps(game_profiles, ensure_ascii=False, indent=2).encode("utf-8")),
-                filename=GAME_BACKUP_FILENAME,
-            ),
-            discord.File(
-                io.BytesIO(json.dumps(unknown_word_phrases, ensure_ascii=False, indent=2).encode("utf-8")),
-                filename=UNKNOWN_BACKUP_FILENAME,
-            ),
-        ]
-        await owner.send(
-            "backup game tự động, giữ tin này để t tự khôi phục sau khi update bot",
-            files=files,
-        )
+        dm = owner.dm_channel or await owner.create_dm()
+        if _backup_message is None:
+            _backup_message = await _find_backup_message(dm)
+        if _backup_message is not None:
+            try:
+                await _backup_message.edit(content=content, attachments=_build_backup_files())
+                _game_backup_dirty = False
+                return
+            except discord.NotFound:
+                _backup_message = None  # tin bị xoá tay thì gửi tin mới
+        _backup_message = await owner.send(content, files=_build_backup_files())
         _game_backup_dirty = False
     except discord.HTTPException as exc:
         log.warning("Không gửi được backup game: %s", exc)
@@ -587,8 +612,8 @@ async def game_backup_loop():
 
 
 async def restore_game_backup_from_dm():
-    """Sau redeploy file local trống thì kéo bản backup mới nhất từ DM chủ bot về."""
-    global game_profiles, unknown_word_phrases
+    """Sau redeploy file local trống thì kéo backup từ tin DM về, tự động hết."""
+    global game_profiles, unknown_word_phrases, _backup_message
     need_profiles = not game_profiles
     need_unknown = not unknown_word_phrases
     if not need_profiles and not need_unknown:
@@ -596,36 +621,33 @@ async def restore_game_backup_from_dm():
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
         dm = owner.dm_channel or await owner.create_dm()
-        async for message in dm.history(limit=100):
-            if not bot.user or message.author.id != bot.user.id:
-                continue
-            for attachment in message.attachments:
-                if need_profiles and attachment.filename == GAME_BACKUP_FILENAME:
-                    try:
-                        cleaned = _clean_game_profiles(
-                            json.loads((await attachment.read()).decode("utf-8"))
-                        )
-                    except (ValueError, json.JSONDecodeError, discord.HTTPException) as exc:
-                        log.warning("Backup profile trong DM lỗi: %s", exc)
-                        continue
-                    need_profiles = False
-                    if cleaned:
-                        game_profiles = cleaned
-                        save_game_data()
-                        log.info("Đã khôi phục %s profile game từ backup DM", len(cleaned))
-                elif need_unknown and attachment.filename == UNKNOWN_BACKUP_FILENAME:
-                    try:
-                        raw = json.loads((await attachment.read()).decode("utf-8"))
-                    except (json.JSONDecodeError, discord.HTTPException) as exc:
-                        log.warning("Backup cụm lạ trong DM lỗi: %s", exc)
-                        continue
-                    need_unknown = False
-                    if isinstance(raw, dict) and raw:
-                        unknown_word_phrases = raw
-                        save_unknown_word_phrases()
-                        log.info("Đã khôi phục %s cụm lạ từ backup DM", len(raw))
-            if not need_profiles and not need_unknown:
-                return
+        message = await _find_backup_message(dm)
+        if message is None:
+            return
+        _backup_message = message
+        for attachment in message.attachments:
+            if need_profiles and attachment.filename == GAME_BACKUP_FILENAME:
+                try:
+                    cleaned = _clean_game_profiles(
+                        json.loads((await attachment.read()).decode("utf-8"))
+                    )
+                except (ValueError, json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup profile trong DM lỗi: %s", exc)
+                    continue
+                if cleaned:
+                    game_profiles = cleaned
+                    save_game_data()
+                    log.info("Đã khôi phục %s profile game từ backup DM", len(cleaned))
+            elif need_unknown and attachment.filename == UNKNOWN_BACKUP_FILENAME:
+                try:
+                    raw = json.loads((await attachment.read()).decode("utf-8"))
+                except (json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup cụm lạ trong DM lỗi: %s", exc)
+                    continue
+                if isinstance(raw, dict) and raw:
+                    unknown_word_phrases = raw
+                    save_unknown_word_phrases()
+                    log.info("Đã khôi phục %s cụm lạ từ backup DM", len(raw))
     except discord.HTTPException as exc:
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
 
