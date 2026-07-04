@@ -541,9 +541,12 @@ def is_game_profile_request(plain):
 
 
 def is_word_game_request(plain):
-    return plain == "noi tu" or any(marker in plain for marker in (
-        "choi noi tu", "noi tu khong", "noi tu di", "zun noi tu", "game noi tu",
-    ))
+    if "noi tu" not in plain:
+        return False
+    if plain == "noi tu":
+        return True
+    words = set(plain.split())
+    return bool(words.intersection({"choi", "solo", "game", "cuoc", "keo", "khong", "di", "thu"}))
 
 
 def parse_word_game_bet(text):
