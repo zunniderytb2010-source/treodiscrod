@@ -878,7 +878,7 @@ async def unfreeze_word_game(channel, key, session):
                 remaining = session.get("turn_remaining")
                 remaining = max(1, min(WORD_GAME_TURN_SECONDS, int(remaining or WORD_GAME_TURN_SECONDS)))
                 sent = await channel.send(
-                    f"{mention} ván chạy tiếp: {session['current_phrase']}... {remaining}",
+                    f"{mention} ván chạy tiếp\n\n**{session['current_phrase']}**... {remaining}",
                     allowed_mentions=mentions,
                 )
                 record_word_game_message(session, sent)
@@ -1699,7 +1699,7 @@ async def handle_word_game_session(message, prompt, session):
             session,
             f"ok cược {bet:,}đ · đúng 2 từ, nối chữ cuối, không lặp/đảo, "
             f"sai 4 lần thua, {WORD_GAME_TURN_SECONDS} giây mỗi lượt\n"
-            f"{start_phrase}... {WORD_GAME_TURN_SECONDS}",
+            f"\n**{start_phrase}**... {WORD_GAME_TURN_SECONDS}",
         )
         start_word_game_timer((message.channel.id, message.author.id), session, sent)
         return
@@ -1754,7 +1754,7 @@ async def handle_word_game_session(message, prompt, session):
     sent = await send_word_game_reply(
         message,
         session,
-        f"{response}... {WORD_GAME_TURN_SECONDS}",
+        f"**{response}**... {WORD_GAME_TURN_SECONDS}",
     )
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
