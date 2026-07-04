@@ -12085,7 +12085,7 @@ EXTRA_RESPONSES_4 = {
     "cũng": ["cũng thế", "cũng được", "cũng vậy"],
     "giới": ["giới hạn", "giới thiệu", "giới trẻ"],
     "ký": ["ký ức", "ký tên", "ký gửi"],
-    "mẻ": ["mẻ cá", "mẻ lưới", "mẻ nếp"],
+    "mẻ": ["mẻ lưới", "mẻ cá", "mẻ rượu", "mẻ bánh", "mẻ kho", "mẻ chua"],
     "nhật": ["nhật ký", "nhật thực", "nhật báo"],
     "nạ": ["nạ dòng"],
     "nọ": ["nọ kia"],

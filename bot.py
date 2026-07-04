@@ -92,7 +92,7 @@ WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
     "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
-    "mẻ nồi", "nhóm sản", "trận w",
+    "mẻ nồi", "mẻ nếp", "nhóm sản", "trận w",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -1012,7 +1012,7 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
 
 
 async def choose_semantic_word_response(last_word, used_phrases, used_required_words):
-    """Thử tối đa 4 câu dictionary rồi AI fallback; chỉ loại khi chấm ra INVALID rõ ràng."""
+    """Thử tối đa 4 câu dictionary rồi AI fallback; bot chỉ phát câu VALID rõ ràng."""
     rejected = set()
     for _ in range(4):
         candidate = choose_dictionary_word_response(
@@ -1023,8 +1023,7 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
         if candidate is None:
             break
         verdict = await judge_word_game_phrase(candidate, source="bot kiểm tra từ điển")
-        if verdict is not False:
-            # Chấm lỗi/không rõ thì vẫn chơi, thà ra từ hơi lạ còn hơn bí oan.
+        if verdict is True:
             return candidate
         rejected.add(canonical_word_game_text(candidate))
 
@@ -1033,7 +1032,7 @@ async def choose_semantic_word_response(last_word, used_phrases, used_required_w
         candidate = await ai_word_game_fallback(
             last_word, used_phrases, used_required_words, temperature=temperature,
         )
-        if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is not False:
+        if candidate and await judge_word_game_phrase(candidate, source="bot AI fallback") is True:
             return candidate
     return None
 
