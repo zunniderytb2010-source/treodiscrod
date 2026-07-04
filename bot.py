@@ -557,6 +557,18 @@ def is_word_game_request(plain):
     return bool(words.intersection({"choi", "solo", "game", "cuoc", "keo", "khong", "di", "thu"}))
 
 
+def is_word_game_status_request(plain):
+    return "noi tu" in plain and bool(set(plain.split()).intersection({"dang", "chs", "status", "tiep"}))
+
+
+def looks_like_word_game_reply(text):
+    plain = normalize_word_game_text(text)
+    return any(marker in plain for marker in (
+        "m noi tiep bang", "m noi tu bat dau bang", "luat dung 2 tu",
+        "hop le t noi", "t bi tu roi", "m thua mat",
+    ))
+
+
 def parse_word_game_bet(text):
     """Hỗ trợ 1000, 1.000, 1000đ, 1k, 1 nghìn, 1tr, 1 triệu."""
     plain = (text or "").lower().strip().replace("đ", "d")
@@ -777,6 +789,16 @@ async def handle_word_game_session(message, prompt, session):
         return
 
     plain = normalize_word_game_text(prompt)
+    if is_word_game_status_request(plain):
+        if session["state"] == "waiting_bet":
+            await send_reply(message, "đang chờ m nhập tiền cược", remember=False)
+        else:
+            await send_reply(
+                message,
+                f'đang chơi, m phải nối 2 từ bắt đầu bằng "{session["last_word"]}"',
+                remember=False,
+            )
+        return
     if is_word_game_request(plain):
         state_text = "đang chờ m đặt cược rồi" if session["state"] == "waiting_bet" else "đang chơi rồi, nối câu hiện tại đi"
         await send_reply(message, state_text, remember=False)
@@ -873,7 +895,7 @@ async def handle_word_game_session(message, prompt, session):
     )
 
 
-async def handle_word_game_intents(message, prompt, invoked):
+async def handle_word_game_intents(message, prompt, invoked, replied_message=None):
     """Return True khi profile/game đã xử lý và on_message phải dừng."""
     key = (message.channel.id, message.author.id)
     session = word_game_sessions.get(key)
@@ -884,6 +906,24 @@ async def handle_word_game_intents(message, prompt, invoked):
         return False
 
     plain = normalize_word_game_text(prompt)
+    if is_word_game_status_request(plain):
+        await send_reply(message, "không có ván nối từ nào đang chạy, gọi t chơi nối từ lại đi", remember=False)
+        return True
+    if (
+        replied_message
+        and bot.user
+        and replied_message.author.id == bot.user.id
+        and looks_like_word_game_reply(replied_message.content)
+        and not is_word_game_request(plain)
+        and not is_create_game_account_request(plain)
+        and not is_game_profile_request(plain)
+    ):
+        await send_reply(
+            message,
+            "ván trong tin nhắn đó không còn chạy, chắc t vừa restart; gọi nối từ để mở ván mới",
+            remember=False,
+        )
+        return True
     if is_create_game_account_request(plain):
         profile, created = get_or_create_game_profile(message.author)
         heading = "tạo xong tài khoản cho m rồi" if created else "m có tài khoản rồi đây"
@@ -1737,7 +1777,7 @@ async def on_message(message):
     else:
         prompt = extract_prompt(message)
     invoked = is_ask or mentioned or wake or reply_to_bot
-    if await handle_word_game_intents(message, prompt, invoked):
+    if await handle_word_game_intents(message, prompt, invoked, ref):
         return
 
     # ---- roast bằng ngôn ngữ tự nhiên: "zun roast @user", "ê zun khịa @user" ----
