@@ -92,6 +92,11 @@ WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
 }
+# Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
+WORD_GAME_BANNED_WORDS = {
+    "lồn", "loz", "cặc", "cak", "buồi", "đụ", "địt", "đéo", "đĩ", "điếm",
+    "cứt", "cức",
+}
 
 ACCOUNT_CONTEXT_BLOCKLIST = {
     "google", "gmail", "youtube", "yt", "facebook", "fb", "tiktok",
@@ -825,6 +830,7 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             and words[0] == last_word
             and normalized not in used_phrases
             and not reverses_used_phrase(normalized, used_phrases)
+            and not any(word in WORD_GAME_BANNED_WORDS for word in words)
         ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
@@ -852,6 +858,7 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
         or words[0] != last_word
         or normalized in used_phrases
         or reverses_used_phrase(normalized, used_phrases)
+        or any(word in WORD_GAME_BANNED_WORDS for word in words)
     ):
         return None
     return re.sub(r"\s+", " ", answer).strip().lower()
@@ -1052,14 +1059,18 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message):
         log.warning("Đếm giờ nối từ lỗi: %s", exc)
 
 
-async def register_word_game_strike(message, session, phrase_key):
+async def register_word_game_strike(message, session, phrase_key, profane=False):
     """Từ sai/vô nghĩa không thua ngay: khịa tăng dần, đủ 4 lần trong ván mới xử thua."""
     session["strikes"] = session.get("strikes", 0) + 1
     strikes = session["strikes"]
     if strikes >= WORD_GAME_MAX_STRIKES:
         await finish_word_game_loss(message, session, "sai lần 4 rồi, hết cứu")
         return
-    if strikes == 1:
+    if profane:
+        # Không lặp lại từ tục trong câu trả lời.
+        text = "chửi tục không tính nha, nói cụm sạch đi" if strikes == 1 \
+            else ("lại tục nữa, nhắc lần cuối đó" if strikes == 2 else "??")
+    elif strikes == 1:
         text = f'từ "{phrase_key}" là cái deo j?'
     elif strikes == 2:
         text = f'"{phrase_key}" là cái j nữa?'
@@ -1180,6 +1191,9 @@ async def handle_word_game_session(message, prompt, session):
     # Người chơi đã ra lượt thật, dừng đồng hồ 10 giây trong lúc chấm.
     cancel_word_game_timer(session)
     used_required_words = session.setdefault("used_required_words", {session["last_word"]})
+    if any(word in WORD_GAME_BANNED_WORDS for word in words):
+        await register_word_game_strike(message, session, phrase_key, profane=True)
+        return
     if (
         len(words) != 2
         or words[0] != session["last_word"]
