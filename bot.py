@@ -60,6 +60,8 @@ GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_
 UNKNOWN_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unknown_word_phrases.json")
 WORD_GAME_TIMEOUT_SECONDS = 5 * 60
 WORD_GAME_TURN_SECONDS = 10
+WORD_GAME_LOG_CHANNEL_ID = int(os.getenv("WORD_GAME_LOG_CHANNEL_ID", "0") or 0)
+WORD_GAME_LOG_CHANNEL_NAME = os.getenv("WORD_GAME_LOG_CHANNEL_NAME", "nối-từ").strip() or "nối-từ"
 # Host redeploy là mất file local, nên giữ 1 tin DM chứa backup và edit tại chỗ.
 GAME_BACKUP_INTERVAL_SECONDS = 5 * 60
 GAME_BACKUP_FILENAME = "game_data_backup.json"
@@ -1145,6 +1147,103 @@ def cancel_word_game_timer(session):
         task.cancel()
 
 
+def record_word_game_message(session, message):
+    """Giữ đúng các tin thuộc ván để lập biên bản và dọn sau khi có kết quả."""
+    messages = session.setdefault("game_messages", [])
+    if any(item.id == message.id for item in messages):
+        return
+    messages.append(message)
+
+
+async def send_word_game_reply(message, session, content, ping=True):
+    sent = await send_reply(message, content, remember=False, ping=ping)
+    record_word_game_message(session, sent)
+    return sent
+
+
+def find_word_game_log_channel(source_channel):
+    guild = getattr(source_channel, "guild", None)
+    if guild is None:
+        return None
+    if WORD_GAME_LOG_CHANNEL_ID:
+        channel = guild.get_channel(WORD_GAME_LOG_CHANNEL_ID) or bot.get_channel(WORD_GAME_LOG_CHANNEL_ID)
+        if channel is not None and hasattr(channel, "send"):
+            return channel
+    expected = normalize_word_game_text(WORD_GAME_LOG_CHANNEL_NAME)
+    for channel in guild.text_channels:
+        if normalize_word_game_text(channel.name) == expected:
+            return channel
+    return None
+
+
+def build_word_game_transcript(session, won):
+    result = "GIÀNH CHIẾN THẮNG" if won else "THUA CUỘC"
+    lines = [
+        "BIÊN BẢN TRÒ CHƠI NỐI TỪ",
+        f"ID ván: {session.get('game_id', 'không rõ')}",
+        f"Người chơi: {session.get('player_name', 'không rõ')}",
+        f"ID người chơi: {session.get('player_id', 'không rõ')}",
+        f"Máy chủ: {session.get('guild_name', 'không rõ')}",
+        f"Kênh chơi: #{session.get('source_channel_name', 'không rõ')}",
+        f"Tiền cược: {session.get('bet', 0):,}đ",
+        f"Kết quả: {result}",
+        "",
+        "--- TOÀN BỘ TIN NHẮN CỦA VÁN ---",
+    ]
+    local_tz = datetime.timezone(datetime.timedelta(hours=7))
+    for item in session.get("game_messages", []):
+        created_at = getattr(item, "created_at", None)
+        timestamp = created_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S") if created_at else "không rõ giờ"
+        author = getattr(item, "author", None)
+        author_name = getattr(author, "display_name", None) or getattr(author, "name", "không rõ")
+        author_id = getattr(author, "id", "không rõ")
+        content = (getattr(item, "content", "") or "").strip() or "[tin nhắn không có chữ]"
+        lines.append(f"[{timestamp}] {author_name} ({author_id}): {content}")
+    return "\n".join(lines) + "\n"
+
+
+async def archive_and_cleanup_word_game(session, source_channel, won):
+    """Gửi biên bản trước; chỉ dọn tin khi bản lưu đã lên kênh thành công."""
+    log_channel = find_word_game_log_channel(source_channel)
+    if log_channel is None:
+        log.warning(
+            "Không tìm thấy kênh lưu nối từ %r trong guild %s; giữ nguyên tin nhắn ván %s",
+            WORD_GAME_LOG_CHANNEL_NAME,
+            getattr(getattr(source_channel, "guild", None), "id", None),
+            session.get("game_id"),
+        )
+        return False
+
+    player_id = session.get("player_id")
+    game_id = session.get("game_id")
+    filename = f"{player_id}_{game_id}.txt"
+    report = build_word_game_transcript(session, won).encode("utf-8")
+    result_text = "giành chiến thắng" if won else "thua cuộc"
+    try:
+        await log_channel.send(
+            f"<@{player_id}> {result_text} trong trò nối từ",
+            file=discord.File(io.BytesIO(report), filename=filename),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
+    except discord.HTTPException as exc:
+        log.warning("Không gửi được biên bản nối từ %s: %s", game_id, exc)
+        return False
+
+    # Xóa từ mới tới cũ để reply không còn treo vào tin đã bị xóa.
+    failed = 0
+    for item in reversed(session.get("game_messages", [])):
+        try:
+            await item.delete()
+        except discord.NotFound:
+            pass
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            failed += 1
+            log.warning("Không xóa được tin %s của ván %s: %s", item.id, game_id, exc)
+    if failed:
+        log.warning("Ván %s còn %s tin không xóa được; kiểm tra quyền Manage Messages", game_id, failed)
+    return True
+
+
 def start_word_game_timer(key, session, bot_message):
     """Mỗi lần bot ra từ thì đếm 10 giây cho người chơi bằng emoji trên tin đó."""
     cancel_word_game_timer(session)
@@ -1192,11 +1291,13 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message):
             if profile is None:
                 return
             update_game_result(profile, won=False)
-            await bot_message.reply(
+            sent = await bot_message.reply(
                 f"<@{key[1]}> hết 10 giây rồi\nm thua mất {session['bet']:,}đ\n"
                 f"số dư giờ: {profile['balance']:,}đ",
                 allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
             )
+            record_word_game_message(session, sent)
+            await archive_and_cleanup_word_game(session, bot_message.channel, won=False)
     except asyncio.CancelledError:
         raise
     except discord.HTTPException as exc:
@@ -1221,7 +1322,7 @@ async def register_word_game_strike(message, session, phrase_key, profane=False)
     else:
         text = "??"
     session["updated_at"] = time.time()
-    sent = await send_reply(message, text, remember=False)
+    sent = await send_word_game_reply(message, session, text)
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
 
@@ -1233,11 +1334,12 @@ async def finish_word_game_win(message, session):
     update_game_result(profile, won=True)
     cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
-    await send_reply(
+    await send_word_game_reply(
         message,
+        session,
         f"t bí từ rồi\nm thắng +{prize:,}đ\nsố dư giờ: {profile['balance']:,}đ",
-        remember=False,
     )
+    await archive_and_cleanup_word_game(session, message.channel, won=True)
 
 
 async def finish_word_game_loss(message, session, reason=""):
@@ -1247,54 +1349,56 @@ async def finish_word_game_loss(message, session, reason=""):
     cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
     prefix = f"{reason}\n" if reason else ""
-    await send_reply(
+    await send_word_game_reply(
         message,
+        session,
         f"{prefix}m thua mất {session['bet']:,}đ\nsố dư giờ: {profile['balance']:,}đ",
-        remember=False,
     )
+    await archive_and_cleanup_word_game(session, message.channel, won=False)
 
 
 async def handle_word_game_session(message, prompt, session):
+    record_word_game_message(session, message)
     now = time.time()
     if now - session["updated_at"] > WORD_GAME_TIMEOUT_SECONDS:
         if session["state"] == "active":
             await finish_word_game_loss(message, session, "quá 5 phút không nối, xử thua")
         else:
             word_game_sessions.pop((message.channel.id, message.author.id), None)
-            await send_reply(message, "hết 5 phút rồi, t hủy kèo cược", remember=False)
+            await send_word_game_reply(message, session, "hết 5 phút rồi, t hủy kèo cược")
         return
 
     plain = normalize_word_game_text(prompt)
     if is_word_game_status_request(plain):
         if session["state"] == "waiting_bet":
-            await send_reply(message, "đang chờ m nhập tiền cược", remember=False)
+            await send_word_game_reply(message, session, "đang chờ m nhập tiền cược")
         else:
-            await send_reply(
+            await send_word_game_reply(
                 message,
+                session,
                 f'đang chơi, m phải nối 2 từ bắt đầu bằng "{session["last_word"]}"',
-                remember=False,
             )
         return
     if is_word_game_request(plain):
         state_text = "đang chờ m đặt cược rồi" if session["state"] == "waiting_bet" else "đang chơi rồi, nối câu hiện tại đi"
-        await send_reply(message, state_text, remember=False)
+        await send_word_game_reply(message, session, state_text)
         return
     if plain in {"huy", "dung", "bo cuoc", "chiu"}:
         if session["state"] == "active":
             await finish_word_game_loss(message, session, "m bỏ cuộc")
         else:
             word_game_sessions.pop((message.channel.id, message.author.id), None)
-            await send_reply(message, "ok hủy kèo", remember=False)
+            await send_word_game_reply(message, session, "ok hủy kèo")
         return
 
     profile = game_profile_for(message.author)
     if session["state"] == "waiting_bet":
         bet = parse_word_game_bet(prompt)
         if bet is None or bet > profile["balance"]:
-            await send_reply(
+            await send_word_game_reply(
                 message,
+                session,
                 f"tiền cược phải từ 1đ tới {profile['balance']:,}đ",
-                remember=False,
             )
             return
         profile["balance"] -= bet
@@ -1312,12 +1416,12 @@ async def handle_word_game_session(message, prompt, session):
             "started_at": now,
             "updated_at": now,
         })
-        sent = await send_reply(
+        sent = await send_word_game_reply(
             message,
+            session,
             f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hoặc đảo cụm cũ\n"
             f"mỗi lượt m có 10 giây, sai từ 4 lần trong ván là thua\n"
             f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
-            remember=False,
         )
         start_word_game_timer((message.channel.id, message.author.id), session, sent)
         return
@@ -1326,10 +1430,10 @@ async def handle_word_game_session(message, prompt, session):
     words = phrase_key.split()
     if not words:
         # Tin chỉ có dấu câu/emoji kiểu "?" không phải lượt chơi, nhắc chứ không xử thua.
-        await send_reply(
+        await send_word_game_reply(
             message,
+            session,
             f'đang chơi mà, nối 2 từ bắt đầu bằng "{session["last_word"]}" đi, muốn nghỉ thì nói bỏ cuộc',
-            remember=False,
         )
         return
     # Người chơi đã ra lượt thật, dừng đồng hồ 10 giây trong lúc chấm.
@@ -1369,10 +1473,10 @@ async def handle_word_game_session(message, prompt, session):
     session["last_word"] = response_words[-1]
     session["updated_at"] = time.time()
 
-    sent = await send_reply(
+    sent = await send_word_game_reply(
         message,
+        session,
         f"hợp lệ\nt nối: {response}\nm nối tiếp bằng: {response_words[-1]}",
-        remember=False,
     )
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
@@ -1431,7 +1535,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
             if profile["balance"] <= 0:
                 await send_reply(message, "m hết tiền rồi nên chưa đặt cược được", remember=False)
                 return True
-            word_game_sessions[key] = {
+            session = {
                 "state": "waiting_bet",
                 "bet": 0,
                 "current_phrase": "",
@@ -1440,12 +1544,20 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
                 "strikes": 0,
                 "started_at": time.time(),
                 "updated_at": time.time(),
+                "game_id": message.id,
+                "player_id": message.author.id,
+                "player_name": message.author.display_name,
+                "guild_name": getattr(message.guild, "name", "không rõ"),
+                "source_channel_name": getattr(message.channel, "name", str(message.channel.id)),
+                "game_messages": [],
             }
-            await send_reply(
+            word_game_sessions[key] = session
+            record_word_game_message(session, message)
+            await send_word_game_reply(
                 message,
+                session,
                 f"đặt bao nhiêu tiền, số dư m có {profile['balance']:,}đ\n"
                 "thắng ăn gấp đôi thua mất cược",
-                remember=False,
             )
             return True
         return False
