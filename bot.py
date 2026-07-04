@@ -757,11 +757,22 @@ async def ai_task(gid, task, user_content, max_tokens=400, temperature=0.85):
     return await _claude(messages, max_tokens, temperature)
 
 
-async def make_roast(gid, target_name):
-    task = ("viết ĐÚNG 1-2 câu cà khịa/roast vui, láo nhẹ về người được nhắc tên. "
-            "Ko từ cấm, ko chủng tộc, ko đụng gia đình, ko đe doạ, ko body-shaming nặng. "
-            "Chỉ trả về câu roast, ko giải thích.")
-    return await ai_task(gid, task, f"Roast {target_name} đi", max_tokens=200, temperature=0.95)
+async def make_roast(gid, target_name, channel_id=None):
+    context = build_channel_context(channel_id) if channel_id else ""
+    task = (
+        f"viết ĐÚNG 1-2 câu roast {target_name}. Phong cách gen z 2026: cụt, bất ngờ, meme, viết thường, đọc phát cười phát.\n"
+        "- Có [Tin nhắn gần đây trong kênh] thì bám vào đúng cái nó vừa nói/cách nó gõ mà roast, càng cá nhân càng đau.\n"
+        "- Không biết gì về nó thì chế từ cái tên hoặc vibe gamer. TUYỆT ĐỐI không hỏi context, "
+        "không nói kiểu 't không biết ai là...', 'cụ thể hơn đi'. Kiểu gì cũng phải phun ra một câu roast.\n"
+        "- CẤM từ bro. Cấm mở đầu bằng 'thằng này', 'kiểu người'. Cấm so sánh cũ rích kiểu google translate, thời đồ đá, tiền sử.\n"
+        "- Không lặp lại hay na ná câu roast Zun đã dùng trong tin nhắn gần đây, mỗi lần một góc chọc mới.\n"
+        "- Vibe tham khảo (chế mới, đừng copy): 'tên nghe như mật khẩu wifi quán net', "
+        "'afk từ trong game ra tới ngoài đời', 'nó là lý do game có nút report', 'đến autocorrect còn lười sửa cho nó'.\n"
+        "- Ko từ cấm, ko chủng tộc, ko đụng gia đình, ko đe doạ, ko body-shaming nặng.\n"
+        "Chỉ trả về câu roast, ko giải thích."
+    )
+    user_content = f"{context}\n\nRoast {target_name} đi" if context else f"Roast {target_name} đi"
+    return await ai_task(gid, task, user_content, max_tokens=200, temperature=1.0)
 
 
 def extract_prompt(message):
@@ -953,7 +964,7 @@ async def on_message(message):
         log.info(f"Roast: {message.author} -> {target} in #{message.channel}")
         async with message.channel.typing():
             try:
-                text = await make_roast(gid, target.display_name)
+                text = await make_roast(gid, target.display_name, channel_id=message.channel.id)
                 await send_roast_reply(message, f"{target.mention} {text}")
             except Exception as e:
                 log.error("Claude request failed in roast (%s)", type(e).__name__)
@@ -1073,7 +1084,7 @@ async def slash_roast(interaction: discord.Interaction, user: discord.Member):
     gid = get_gid(interaction)
     log.info(f"/roast by {interaction.user} -> {user}")
     try:
-        text = await make_roast(gid, user.display_name)
+        text = await make_roast(gid, user.display_name, channel_id=interaction.channel_id)
         await interaction.followup.send(f"{user.mention} {text}"[:2000])
     except Exception as e:
         log.error("Claude request failed in /roast (%s)", type(e).__name__)
