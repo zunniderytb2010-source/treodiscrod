@@ -71,6 +71,7 @@ WORD_GAME_MAX_STRIKES = 4
 WORD_GAME_COUNT_EMOJIS = [f"{digit}️⃣" for digit in "0123456789"] + ["\U0001F51F"]
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
+WORD_GAME_BLOCKED_OPENING_WORDS = {"bánh"}
 FAIR_WORD_GAME_STARTS = (
     "ăn cơm", "đi học", "chơi game", "làm việc", "uống nước", "đọc sách",
     "nghe nhạc", "xem phim", "nấu ăn", "mua đồ", "học bài", "vẽ tranh",
@@ -93,6 +94,7 @@ WORD_GAME_ALWAYS_VALID = {
     "ngủ gật", "gật gù", "gù lưng", "lưng áo", "áo khoác",
     "bài gửi", "hoàng tử", "khát vọng", "thi công", "tiền tệ", "trai xinh",
     "tệ nạn", "điền kinh", "đói khát", "đạc điền", "đẹp đẽ", "đồ đạc",
+    "bánh pía", "pía chay", "chay trường", "chay tịnh",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
@@ -936,7 +938,12 @@ def ensure_word_game_dictionary():
     word_game_start_pool = []
     for phrase in FAIR_WORD_GAME_STARTS:
         words = canonical_word_game_text(phrase).split()
-        if len(words) == 2 and words[-1] not in word_game_dead_ends and words[-1] in word_game_response_map:
+        if (
+            len(words) == 2
+            and words[-1] not in WORD_GAME_BLOCKED_OPENING_WORDS
+            and words[-1] not in word_game_dead_ends
+            and words[-1] in word_game_response_map
+        ):
             word_game_start_pool.append(phrase)
     log.info(
         "Đã index từ điển nối từ: %s key, %s câu",
@@ -947,7 +954,11 @@ def ensure_word_game_dictionary():
 
 def choose_word_game_start():
     ensure_word_game_dictionary()
-    return random.choice(word_game_start_pool or START_PHRASES)
+    fallback_starts = [
+        phrase for phrase in START_PHRASES
+        if canonical_word_game_text(phrase).split()[-1] not in WORD_GAME_BLOCKED_OPENING_WORDS
+    ]
+    return random.choice(word_game_start_pool or fallback_starts or START_PHRASES)
 
 
 def reverses_used_phrase(phrase, used_phrases):

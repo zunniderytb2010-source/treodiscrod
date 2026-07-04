@@ -12129,3 +12129,15 @@ for _key, _phrases in EXTRA_RESPONSES_5.items():
         if _phrase not in _bucket:
             _bucket.append(_phrase)
 DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
+
+# Sửa ván bánh pía: bot phải còn đường nối hợp lệ sau "pía".
+EXTRA_RESPONSES_6 = {
+    "pía": ["pía chay"],
+    "chay": ["chay trường", "chay tịnh"],
+}
+for _key, _phrases in EXTRA_RESPONSES_6.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
