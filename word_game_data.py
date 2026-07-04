@@ -12051,3 +12051,17 @@ DEAD_END_WORDS.update({
     "gũi", "ào", "ã", "thẩn", "vót", "nghén", "gò", "rằm", "rưởi", "thải",
     "dính", "tang", "mó", "khoét", "tơi", "news", "đùn", "dầm", "manh",
 })
+
+# Bo sung tu ban xuat /cactukotrongtudien (2026-07-04).
+EXTRA_RESPONSES_2 = {
+    "co": ["co giật", "co kéo", "co chân", "co ro"],
+    "thót": ["thót tim", "thót bụng"],
+    "gân": ["gân cổ", "gân guốc", "gân bò"],
+    "giật": ["giật thót", "giật gân", "giật dây"],
+}
+for _key, _phrases in EXTRA_RESPONSES_2.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
