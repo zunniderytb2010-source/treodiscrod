@@ -87,12 +87,15 @@ WORD_GAME_FILLER_WORDS = {
 WORD_GAME_ALWAYS_VALID = {
     "ảnh nét", "ngọt lịm", "người ngợm", "nhiếc móc", "túi da", "móc túi", "hình ảnh",
     "chụp hình", "đây đó", "nay mai", "nay mưa", "nay nắng",
+    "cụ thể", "thể hiện", "hiện nay", "trưa nay", "mai đi", "đi ngủ",
+    "ngủ gật", "gật gù", "gù lưng", "lưng áo", "áo khoác",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
     "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
-    "mẻ nồi", "mẻ nếp", "nay đây", "nhóm sản", "trận w",
+    "mẻ nồi", "mẻ nếp", "nay đây", "trưa trực", "mai đó", "gù đầu",
+    "nhóm sản", "trận w",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -462,9 +465,9 @@ _TONE_PLACEMENT_MAP = {
 }
 # Riêng "uy" phải chừa chữ sau "q": "quý", "quỳ" vốn đặt dấu trên y là đúng.
 _TONE_PLACEMENT_UY_RES = [
-    (re.compile(r"(?<!q)uỳ"), "ùy"), (re.compile(r"(?<!q)uý"), "úy"),
-    (re.compile(r"(?<!q)uỷ"), "ủy"), (re.compile(r"(?<!q)uỹ"), "ũy"),
-    (re.compile(r"(?<!q)uỵ"), "ụy"),
+    (re.compile(r"(?<!q)uỳ(?=$|[^\w])"), "ùy"), (re.compile(r"(?<!q)uý(?=$|[^\w])"), "úy"),
+    (re.compile(r"(?<!q)uỷ(?=$|[^\w])"), "ủy"), (re.compile(r"(?<!q)uỹ(?=$|[^\w])"), "ũy"),
+    (re.compile(r"(?<!q)uỵ(?=$|[^\w])"), "ụy"),
 ]
 
 
@@ -473,7 +476,8 @@ def canonical_word_game_text(text):
     text = unicodedata.normalize("NFC", (text or "").lower())
     for old, new in _TONE_PLACEMENT_MAP.items():
         if old in text:
-            text = text.replace(old, new)
+            # Chỉ đổi kiểu đặt dấu ở cuối âm tiết: hoá -> hóa; không phá khoác -> khóac.
+            text = re.sub(re.escape(old) + r"(?=$|[^\w])", new, text)
     for pattern, new in _TONE_PLACEMENT_UY_RES:
         text = pattern.sub(new, text)
     text = "".join(ch if ch.isalnum() else " " for ch in text)
@@ -945,11 +949,11 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         valid = word_game_validity_cache[canonical]
         record_unknown_word_phrase(canonical, source, valid)
         return valid
-    if canonical in WORD_GAME_ALWAYS_VALID:
+    if canonical in {canonical_word_game_text(item) for item in WORD_GAME_ALWAYS_VALID}:
         word_game_validity_cache[canonical] = True
         record_unknown_word_phrase(canonical, source, True)
         return True
-    if canonical in WORD_GAME_ALWAYS_INVALID:
+    if canonical in {canonical_word_game_text(item) for item in WORD_GAME_ALWAYS_INVALID}:
         word_game_validity_cache[canonical] = False
         record_unknown_word_phrase(canonical, source, False)
         return False
