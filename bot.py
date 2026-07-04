@@ -95,6 +95,8 @@ WORD_GAME_ALWAYS_VALID = {
     "bài gửi", "hoàng tử", "khát vọng", "thi công", "tiền tệ", "trai xinh",
     "tệ nạn", "điền kinh", "đói khát", "đạc điền", "đẹp đẽ", "đồ đạc",
     "bánh pía", "pía chay", "chay trường", "chay tịnh",
+    "bào ngư", "cật lực", "dầm mưa", "lưới trời", "lưỡng lự", "lực lưỡng",
+    "mạng lưới", "ngư dân", "nước đái", "tim cật", "trời đất", "đá bào",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
@@ -102,6 +104,7 @@ WORD_GAME_ALWAYS_INVALID = {
     "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
     "mẻ nồi", "mẻ nếp", "nay đây", "trưa trực", "mai đó", "gù đầu",
     "hòang tử", "đẽ gọt", "nhóm sản", "trận w",
+    "dầm thấm", "lự là", "lự một", "lự tình", "lự điều", "rãi rác",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
