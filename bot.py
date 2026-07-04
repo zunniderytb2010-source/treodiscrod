@@ -325,6 +325,7 @@ bot_analyses = {}                                 # (guild_id, bot_id) -> saved 
 latest_bot_analysis = {}                          # guild_id -> bot_id
 game_profiles = {}                                # discord user id string -> profile
 word_game_sessions = {}                           # (channel_id, user_id) -> session
+word_game_locks = defaultdict(asyncio.Lock)       # (channel_id, user_id) -> khoá chống 2 tin xử lý chồng
 word_game_response_map = None                     # normalized dictionary, built lazily
 word_game_dead_ends = None                        # normalized dead-end words
 word_game_start_pool = None                       # easy starts, built lazily
@@ -981,6 +982,14 @@ async def handle_word_game_session(message, prompt, session):
 
     phrase_key = canonical_word_game_text(prompt)
     words = phrase_key.split()
+    if not words:
+        # Tin chỉ có dấu câu/emoji kiểu "?" không phải lượt chơi, nhắc chứ không xử thua.
+        await send_reply(
+            message,
+            f'đang chơi mà, nối 2 từ bắt đầu bằng "{session["last_word"]}" đi, muốn nghỉ thì nói bỏ cuộc',
+            remember=False,
+        )
+        return
     if len(words) != 2:
         await finish_word_game_loss(message, session, "sai luật rồi, phải nói đúng 2 từ")
         return
@@ -1036,69 +1045,74 @@ async def handle_word_game_session(message, prompt, session):
 async def handle_word_game_intents(message, prompt, invoked, replied_message=None):
     """Return True khi profile/game đã xử lý và on_message phải dừng."""
     key = (message.channel.id, message.author.id)
-    session = word_game_sessions.get(key)
-    if session:
-        await handle_word_game_session(message, prompt, session)
-        return True
-    if not invoked:
+    if key not in word_game_sessions and not invoked:
         return False
+    # Khoá theo từng người chơi: tin sau phải chờ tin trước xử lý xong,
+    # tránh 2 tin cùng lúc làm ván bị xử thua oan rồi biến mất.
+    async with word_game_locks[key]:
+        session = word_game_sessions.get(key)
+        if session:
+            await handle_word_game_session(message, prompt, session)
+            return True
+        if not invoked:
+            return False
 
-    plain = normalize_word_game_text(prompt)
-    if is_word_game_status_request(plain):
-        await send_reply(message, "không có ván nối từ nào đang chạy, gọi t chơi nối từ lại đi", remember=False)
-        return True
-    if (
-        replied_message
-        and bot.user
-        and replied_message.author.id == bot.user.id
-        and looks_like_word_game_reply(replied_message.content)
-        and not is_word_game_request(plain)
-        and not is_create_game_account_request(plain)
-        and not is_game_profile_request(plain)
-    ):
-        await send_reply(
-            message,
-            "ván trong tin nhắn đó không còn chạy, chắc t vừa restart; gọi nối từ để mở ván mới",
-            remember=False,
-        )
-        return True
-    if is_create_game_account_request(plain):
-        profile, created = get_or_create_game_profile(message.author)
-        heading = "tạo xong tài khoản cho m rồi" if created else "m có tài khoản rồi đây"
-        await send_reply(message, format_game_profile(profile, heading), remember=False)
-        return True
-    if is_game_profile_request(plain):
-        profile = game_profile_for(message.author)
-        if profile is None:
-            await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
-        else:
-            await send_reply(message, format_game_profile(profile), remember=False)
-        return True
-    if is_word_game_request(plain):
-        profile = game_profile_for(message.author)
-        if profile is None:
-            await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+        plain = normalize_word_game_text(prompt)
+        if is_word_game_status_request(plain):
+            await send_reply(message, "không có ván nối từ nào đang chạy, gọi t chơi nối từ lại đi", remember=False)
             return True
-        if profile["balance"] <= 0:
-            await send_reply(message, "m hết tiền rồi nên chưa đặt cược được", remember=False)
+        if (
+            replied_message
+            and bot.user
+            and replied_message.author.id == bot.user.id
+            and looks_like_word_game_reply(replied_message.content)
+            and not is_word_game_request(plain)
+            and not is_create_game_account_request(plain)
+            and not is_game_profile_request(plain)
+        ):
+            await send_reply(
+                message,
+                "ván trong tin nhắn đó không còn chạy, chắc t vừa restart; gọi nối từ để mở ván mới",
+                remember=False,
+            )
             return True
-        word_game_sessions[key] = {
-            "state": "waiting_bet",
-            "bet": 0,
-            "current_phrase": "",
-            "last_word": "",
-            "used_phrases": set(),
-            "started_at": time.time(),
-            "updated_at": time.time(),
-        }
-        await send_reply(
-            message,
-            f"đặt bao nhiêu tiền, số dư m có {profile['balance']:,}đ\n"
-            "thắng ăn gấp đôi thua mất cược",
-            remember=False,
-        )
-        return True
-    return False
+        if is_create_game_account_request(plain):
+            profile, created = get_or_create_game_profile(message.author)
+            heading = "tạo xong tài khoản cho m rồi" if created else "m có tài khoản rồi đây"
+            await send_reply(message, format_game_profile(profile, heading), remember=False)
+            return True
+        if is_game_profile_request(plain):
+            profile = game_profile_for(message.author)
+            if profile is None:
+                await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+            else:
+                await send_reply(message, format_game_profile(profile), remember=False)
+            return True
+        if is_word_game_request(plain):
+            profile = game_profile_for(message.author)
+            if profile is None:
+                await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+                return True
+            if profile["balance"] <= 0:
+                await send_reply(message, "m hết tiền rồi nên chưa đặt cược được", remember=False)
+                return True
+            word_game_sessions[key] = {
+                "state": "waiting_bet",
+                "bet": 0,
+                "current_phrase": "",
+                "last_word": "",
+                "used_phrases": set(),
+                "started_at": time.time(),
+                "updated_at": time.time(),
+            }
+            await send_reply(
+                message,
+                f"đặt bao nhiêu tiền, số dư m có {profile['balance']:,}đ\n"
+                "thắng ăn gấp đôi thua mất cược",
+                remember=False,
+            )
+            return True
+        return False
 
 
 def _split_text_piece(text, limit, preserve_code=False):
