@@ -12195,3 +12195,14 @@ DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP
 for _phrase in ["lưỡng cực", "lưỡng tính"]:
     if _phrase not in RESPONSE_MAP["lưỡng"]:
         RESPONSE_MAP["lưỡng"].append(_phrase)
+
+# Bo sung tu van choi ngay 2026-07-05 (vong hon).
+EXTRA_RESPONSES_6 = {
+    "vong": ["vong hồn", "vong linh", "vong ân"],
+}
+for _key, _phrases in EXTRA_RESPONSES_6.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}

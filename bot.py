@@ -12,7 +12,6 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
-from types import SimpleNamespace
 
 import anthropic
 import discord
@@ -68,10 +67,10 @@ WORD_GAME_LOG_CHANNEL_NAME = os.getenv("WORD_GAME_LOG_CHANNEL_NAME", "nối-từ
 GAME_BACKUP_INTERVAL_SECONDS = 5 * 60
 GAME_BACKUP_FILENAME = "game_data_backup.json"
 UNKNOWN_BACKUP_FILENAME = "unknown_words_backup.json"
-# Ván đang chơi cũng phải sống qua update: lưu session + đóng băng rồi chạy tiếp.
+# Update/redeploy: báo bảo trì, hoàn tiền cược ván dở, chờ instance cũ backup xong mới khôi phục.
 WORD_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "word_game_sessions.json")
 SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
-WORD_GAME_FREEZE_SECONDS = 20
+MAINTENANCE_RESTORE_DELAY_SECONDS = 20
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_START_BALANCE = 10_000
@@ -640,6 +639,11 @@ async def _find_backup_message(dm):
 async def send_game_backup():
     """Giữ đúng 1 tin DM chứa backup, data đổi thì edit tại chỗ thay vì gửi tin mới."""
     global _game_backup_dirty, _backup_message
+    if not game_profiles and not unknown_word_phrases and not _pending_refunds:
+        # Không bao giờ đè backup đang có dữ liệu bằng trạng thái rỗng (vd instance
+        # mới boot chưa kịp khôi phục) - đây là cách profile bị mất vĩnh viễn.
+        _game_backup_dirty = False
+        return
     content = f"backup game tự động, đừng xoá tin này; cập nhật <t:{int(time.time())}:R>"
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
@@ -671,7 +675,8 @@ async def restore_game_backup_from_dm():
     global game_profiles, unknown_word_phrases, _backup_message
     need_profiles = not game_profiles
     need_unknown = not unknown_word_phrases
-    need_sessions = not _load_local_session_data()
+    local_sessions = _load_local_session_data()
+    need_sessions = not (local_sessions.get("sessions") or local_sessions.get("refunds"))
     if not need_profiles and not need_unknown and not need_sessions:
         return
     try:
@@ -691,7 +696,10 @@ async def restore_game_backup_from_dm():
                     log.warning("Backup profile trong DM lỗi: %s", exc)
                     continue
                 if cleaned:
-                    game_profiles = cleaned
+                    # Merge: backup thắng với user trùng, giữ user vừa tạo trong lúc chờ.
+                    merged = dict(game_profiles)
+                    merged.update(cleaned)
+                    game_profiles = merged
                     save_game_data()
                     log.info("Đã khôi phục %s profile game từ backup DM", len(cleaned))
             elif need_unknown and attachment.filename == UNKNOWN_BACKUP_FILENAME:
@@ -721,45 +729,24 @@ async def restore_game_backup_from_dm():
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
 
 
-# ==================== ĐÓNG BĂNG VÁN QUA UPDATE ====================
+# ==================== BẢO TRÌ + HOÀN TIỀN QUA UPDATE ====================
 def _serialize_word_game_sessions():
-    data = {}
+    """Chỉ giữ thông tin đủ để hoàn tiền nếu bot chết ngang (crash không kịp SIGTERM)."""
+    sessions = {}
     for (channel_id, user_id), session in word_game_sessions.items():
-        messages = []
-        for item in session.get("game_messages", []):
-            author = getattr(item, "author", None)
-            created_at = getattr(item, "created_at", None)
-            messages.append({
-                "id": getattr(item, "id", 0),
-                "content": (getattr(item, "content", "") or "")[:500],
-                "author_name": getattr(author, "display_name", None) or getattr(author, "name", "không rõ"),
-                "author_id": getattr(author, "id", 0),
-                "created_at": created_at.timestamp() if created_at else None,
-            })
-        data[f"{channel_id}:{user_id}"] = {
+        sessions[f"{channel_id}:{user_id}"] = {
             "channel_id": channel_id,
             "user_id": user_id,
             "state": session.get("state"),
             "bet": session.get("bet", 0),
-            "current_phrase": session.get("current_phrase", ""),
-            "last_word": session.get("last_word", ""),
-            "used_phrases": sorted(session.get("used_phrases", set())),
-            "used_required_words": sorted(session.get("used_required_words") or []),
-            "strikes": session.get("strikes", 0),
-            "turn_remaining": session.get("turn_remaining"),
-            "started_at": session.get("started_at"),
-            "game_id": session.get("game_id"),
-            "player_id": session.get("player_id"),
-            "player_name": session.get("player_name"),
-            "guild_name": session.get("guild_name"),
-            "source_channel_name": session.get("source_channel_name"),
-            "messages": messages,
         }
-    return data
+    return {"sessions": sessions, "refunds": _pending_refunds}
+
+
+_pending_refunds = []  # ván bị hủy vì bảo trì, chờ thông báo hoàn tiền sau khi bot dậy
 
 
 def save_word_game_sessions():
-    """Ghi ván đang chơi ra file mỗi khi thay đổi để restart không mất ván."""
     temp_path = WORD_SESSIONS_FILE + ".tmp"
     try:
         with open(temp_path, "w", encoding="utf-8") as handle:
@@ -778,140 +765,109 @@ def _load_local_session_data():
         return {}
 
 
-class RestoredGameMessage:
-    """Tin nhắn của ván trước restart: đủ thông tin cho biên bản và xóa được."""
+def refund_interrupted_word_games():
+    """Hủy mọi ván đang chạy vì bảo trì, cộng lại tiền cược vào profile ngay."""
+    global _pending_refunds
+    refunds = []
+    for (channel_id, user_id), session in list(word_game_sessions.items()):
+        session["frozen"] = True
+        task = session.pop("timer_task", None)
+        if task is not None:
+            task.cancel()
+        bet = int(session.get("bet") or 0)
+        refunded = 0
+        if session.get("state") == "active" and bet > 0:
+            profile = game_profiles.get(str(user_id))
+            if profile is not None:
+                profile["balance"] += bet
+                refunded = bet
+        refunds.append({"channel_id": channel_id, "user_id": user_id, "bet": refunded})
+    word_game_sessions.clear()
+    if any(item["bet"] > 0 for item in refunds):
+        save_game_data()
+    _pending_refunds = refunds
+    save_word_game_sessions()
+    return refunds
 
-    def __init__(self, channel, data):
-        self.id = int(data.get("id") or 0)
-        self._channel = channel
-        self.content = data.get("content", "")
-        self.author = SimpleNamespace(
-            display_name=data.get("author_name") or "không rõ",
-            name=data.get("author_name") or "không rõ",
-            id=data.get("author_id") or 0,
-        )
-        ts = data.get("created_at")
-        self.created_at = (
-            datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) if ts else None
-        )
 
-    async def delete(self):
-        await self._channel.get_partial_message(self.id).delete()
-
-
-async def resume_frozen_word_games():
-    """Sau update: dựng lại từng ván, đóng băng 20 giây rồi chạy tiếp đúng chỗ dừng."""
+async def announce_maintenance_refunds():
+    """Bot dậy sau bảo trì: báo từng kênh là đã hoàn tiền, xử lý cả ván sót do crash."""
+    global _pending_refunds
     data = _load_local_session_data()
-    if not data:
-        return
-    for key_text, item in data.items():
+    announcements = list(data.get("refunds") or [])
+    # Ván còn nằm trong "sessions" nghĩa là bot chết ngang chưa kịp hoàn: hoàn ngay bây giờ.
+    changed = False
+    for item in (data.get("sessions") or {}).values():
+        bet = int(item.get("bet") or 0)
+        if item.get("state") == "active" and bet > 0:
+            profile = game_profiles.get(str(item.get("user_id")))
+            if profile is not None:
+                profile["balance"] += bet
+                changed = True
+                announcements.append({
+                    "channel_id": item.get("channel_id"),
+                    "user_id": item.get("user_id"),
+                    "bet": bet,
+                })
+    if changed:
+        save_game_data()
+    _pending_refunds = []
+    save_word_game_sessions()
+    mentions = discord.AllowedMentions(everyone=False, roles=False, users=True)
+    for item in announcements:
         try:
-            channel_id = int(item.get("channel_id") or key_text.split(":")[0])
-            user_id = int(item.get("user_id") or key_text.split(":")[1])
+            channel_id = int(item.get("channel_id") or 0)
+            user_id = int(item.get("user_id") or 0)
+            bet = int(item.get("bet") or 0)
         except (TypeError, ValueError):
             continue
-        key = (channel_id, user_id)
-        if key in word_game_sessions:
+        if not channel_id or not user_id:
             continue
-        state = item.get("state")
-        if state not in {"active", "waiting_bet"}:
-            continue
-        if state == "active" and (not item.get("last_word") or game_profiles.get(str(user_id)) is None):
-            continue
+        profile = game_profiles.get(str(user_id))
+        balance_text = f"\nsố dư giờ: {profile['balance']:,}đ" if profile else ""
+        text = (
+            f"<@{user_id}> ✅ bảo trì xong, đã hoàn {bet:,}đ tiền cược ván bị gián đoạn{balance_text}"
+            if bet > 0
+            else f"<@{user_id}> ✅ bảo trì xong, kèo cược chưa đặt nên không mất gì; gọi nối từ để chơi lại"
+        )
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        except discord.HTTPException:
-            log.warning("Không mở được kênh %s để resume ván nối từ", channel_id)
-            continue
-        session = {
-            "state": state,
-            "bet": max(0, int(item.get("bet") or 0)),
-            "current_phrase": item.get("current_phrase", ""),
-            "last_word": item.get("last_word", ""),
-            "used_phrases": set(item.get("used_phrases") or []),
-            "used_required_words": set(item.get("used_required_words") or []),
-            "strikes": max(0, int(item.get("strikes") or 0)),
-            "turn_remaining": item.get("turn_remaining"),
-            "started_at": item.get("started_at") or time.time(),
-            "updated_at": time.time(),
-            "frozen": True,
-            "game_id": item.get("game_id"),
-            "player_id": item.get("player_id") or user_id,
-            "player_name": item.get("player_name") or "không rõ",
-            "guild_name": item.get("guild_name") or "không rõ",
-            "source_channel_name": item.get("source_channel_name") or str(channel_id),
-            "game_messages": [RestoredGameMessage(channel, m) for m in item.get("messages") or []],
-        }
-        word_game_sessions[key] = session
-        asyncio.create_task(unfreeze_word_game(channel, key, session))
-    save_word_game_sessions()
-
-
-async def unfreeze_word_game(channel, key, session):
-    """Đếm 20 giây đóng băng bằng cách edit số cuối tin nhắn rồi mở lại ván."""
-    mentions = discord.AllowedMentions(everyone=False, roles=False, users=True)
-    mention = f"<@{key[1]}>"
-    freeze_base = f"{mention} t vừa update xong, ván nối từ đóng băng..."
-    try:
-        msg = await channel.send(
-            f"{freeze_base} {WORD_GAME_FREEZE_SECONDS}",
-            allowed_mentions=mentions,
-        )
-        record_word_game_message(session, msg)
-        start = time.monotonic()
-        for remaining in range(WORD_GAME_FREEZE_SECONDS - 1, -1, -1):
-            delay = start + (WORD_GAME_FREEZE_SECONDS - remaining) - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            if word_game_sessions.get(key) is not session:
-                return
-            try:
-                await msg.edit(content=f"{freeze_base} {remaining}")
-            except discord.HTTPException:
-                pass
-        async with word_game_locks[key]:
-            if word_game_sessions.get(key) is not session:
-                return
-            session["frozen"] = False
-            session["updated_at"] = time.time()
-            if session["state"] == "active":
-                remaining = session.get("turn_remaining")
-                remaining = max(1, min(WORD_GAME_TURN_SECONDS, int(remaining or WORD_GAME_TURN_SECONDS)))
-                sent = await channel.send(
-                    f"{mention} ván chạy tiếp\n\n**{session['current_phrase']}**... {remaining}",
-                    allowed_mentions=mentions,
-                )
-                record_word_game_message(session, sent)
-                start_word_game_timer(key, session, sent, seconds=remaining)
-            else:
-                sent = await channel.send(
-                    f"{mention} ván chạy tiếp, m đặt bao nhiêu tiền?",
-                    allowed_mentions=mentions,
-                )
-                record_word_game_message(session, sent)
-            save_word_game_sessions()
-    except discord.HTTPException as exc:
-        log.warning("Không resume được ván %s: %s", session.get("game_id"), exc)
+            await channel.send(text, allowed_mentions=mentions)
+        except discord.HTTPException as exc:
+            log.warning("Không báo hoàn tiền được ở kênh %s: %s", channel_id, exc)
 
 
 _shutdown_started = False
 
 
 async def graceful_shutdown():
-    """Render gửi SIGTERM khi redeploy: đóng băng ván, backup rồi mới tắt."""
+    """Render gửi SIGTERM khi redeploy: báo bảo trì, hoàn tiền cược, backup rồi mới tắt."""
     global _shutdown_started
     if _shutdown_started:
         return
     _shutdown_started = True
-    log.info("Nhận tín hiệu tắt: đóng băng %s ván nối từ và backup", len(word_game_sessions))
-    for session in word_game_sessions.values():
-        session["frozen"] = True
-        task = session.pop("timer_task", None)
-        if task is not None:
-            task.cancel()
-    save_word_game_sessions()
+    log.info("Nhận tín hiệu tắt: bảo trì, hoàn tiền %s ván nối từ", len(word_game_sessions))
+    refunds = refund_interrupted_word_games()
     try:
         await send_game_backup()
+        mentions = discord.AllowedMentions(everyone=False, roles=False, users=True)
+        for item in refunds:
+            if item["bet"] > 0:
+                text = (
+                    f"<@{item['user_id']}> ⚠️ t bảo trì khoảng {MAINTENANCE_RESTORE_DELAY_SECONDS} giây, "
+                    f"ván nối từ tạm hủy; {item['bet']:,}đ tiền cược sẽ được hoàn khi t quay lại"
+                )
+            else:
+                text = (
+                    f"<@{item['user_id']}> ⚠️ t bảo trì khoảng {MAINTENANCE_RESTORE_DELAY_SECONDS} giây, "
+                    "kèo cược tạm hủy, quay lại t báo"
+                )
+            try:
+                channel = bot.get_channel(item["channel_id"])
+                if channel is not None:
+                    await channel.send(text, allowed_mentions=mentions)
+            except discord.HTTPException:
+                pass
     finally:
         await bot.close()
 
@@ -1517,7 +1473,6 @@ def start_word_game_timer(key, session, bot_message, seconds=WORD_GAME_TURN_SECO
         return
     seconds = max(1, min(WORD_GAME_TURN_SECONDS, int(seconds)))
     session["turn_id"] = session.get("turn_id", 0) + 1
-    session["turn_remaining"] = seconds
     session["timer_task"] = asyncio.create_task(
         word_game_turn_countdown(key, session, session["turn_id"], bot_message, seconds)
     )
@@ -1540,8 +1495,6 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=W
                 or session["state"] != "active"
             ):
                 return
-            session["turn_remaining"] = remaining
-            save_word_game_sessions()
             if remaining != seconds:  # tin gửi ra đã hiện sẵn số đầu
                 try:
                     await bot_message.edit(content=f"{base} {remaining}")
@@ -2808,8 +2761,11 @@ async def on_ready():
     if not _backup_started:
         _backup_started = True
         register_shutdown_handlers()
+        # Render chạy chồng instance khi deploy: chờ instance cũ báo bảo trì + đẩy
+        # bản backup cuối rồi mới khôi phục, không thì đọc phải dữ liệu cũ.
+        await asyncio.sleep(MAINTENANCE_RESTORE_DELAY_SECONDS)
         await restore_game_backup_from_dm()
-        await resume_frozen_word_games()
+        await announce_maintenance_refunds()
         asyncio.create_task(game_backup_loop())
 
 
