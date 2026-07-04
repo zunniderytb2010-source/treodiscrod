@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import datetime
 import logging
 import os
 import random
@@ -41,7 +43,16 @@ CHUNK_SIZE = 1900  # gioi han Discord 2000 ky tu/tin nhan
 CODE_MAX_TOKENS = 4096
 CHAT_MAX_TOKENS = 600
 CODE_THINKING_BUDGET = 4096  # chi code mode moi bat thinking; chat thuong tat de tra loi nhanh ~2s
+OWNER_THINKING_BUDGET = 4096
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ALLOWED_EXT = (".txt", ".py", ".js", ".json", ".lua", ".md")
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("zun")
@@ -51,7 +62,7 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY or None)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(
-    command_prefix="!",
+    command_prefix="?",
     intents=intents,
     help_command=None,
     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
@@ -270,6 +281,9 @@ last_channel_ai_call = {}                         # channel_id -> timestamp
 recent_channel_messages = defaultdict(lambda: deque(maxlen=16))
 last_bot_short_reply = {}                         # channel_id -> câu quick reply gần nhất
 last_quick_call = {}                              # (channel_id, user_id) -> timestamp
+thinking_guilds = set()                           # guild/channel ids where owner enabled thinking
+bot_analyses = {}                                 # (guild_id, bot_id) -> saved analysis
+latest_bot_analysis = {}                          # guild_id -> bot_id
 
 
 # ==================== HELPERS ====================
@@ -292,6 +306,73 @@ async def deny_interaction(interaction):
 def get_gid(obj):
     return getattr(obj, "guild_id", None) or getattr(getattr(obj, "guild", None), "id", None) \
         or getattr(getattr(obj, "channel", None), "id", 0)
+
+
+def parse_duration(text, default_minutes=10):
+    """Đọc thời lượng kiểu 30s, 10m, 2h, 1d hoặc tiếng Việt."""
+    plain = normalize_chat_text(text)
+    match = re.search(
+        r"\b(\d{1,4})\s*(s|sec|giay|m|min|phut|h|hour|gio|d|day|ngay)\b",
+        plain,
+    )
+    if not match:
+        return datetime.timedelta(minutes=default_minutes), f"{default_minutes} phút"
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit in {"s", "sec", "giay"}:
+        delta, label = datetime.timedelta(seconds=amount), f"{amount} giây"
+    elif unit in {"m", "min", "phut"}:
+        delta, label = datetime.timedelta(minutes=amount), f"{amount} phút"
+    elif unit in {"h", "hour", "gio"}:
+        delta, label = datetime.timedelta(hours=amount), f"{amount} giờ"
+    else:
+        delta, label = datetime.timedelta(days=amount), f"{amount} ngày"
+    return min(delta, datetime.timedelta(days=28)), label
+
+
+def owner_moderation_action(message, prompt):
+    """Nhận ?mute/?ban hoặc câu tự nhiên có gọi Zun; không nhận lệnh từ người khác."""
+    raw = (message.content or "").strip().lower()
+    raw_prompt = (prompt or "").lower()
+    if raw.startswith("?mute") or re.search(r"(?<!\w)(?:mute|timeout)(?!\w)", raw_prompt):
+        return "mute"
+    if raw.startswith("?ban") or re.search(r"(?<!\w)ban(?!\w)", raw_prompt):
+        return "ban"
+    return None
+
+
+async def run_owner_moderation(message, action, prompt):
+    if not is_owner(message.author):
+        await send_reply(message, "lệnh này chỉ chủ bot dùng được")
+        return
+    if not message.guild:
+        await send_reply(message, "lệnh quản trị chỉ dùng trong server")
+        return
+    targets = [u for u in message.mentions if u != bot.user]
+    if not targets:
+        await send_reply(message, f"dùng ?{action} @người [thời gian/lý do]")
+        return
+    target = targets[0]
+    if target.id == OWNER_ID:
+        await send_reply(message, "t không tự xử chủ bot")
+        return
+    reason = f"Lệnh của owner {message.author} ({message.author.id})"
+    try:
+        if action == "mute":
+            if not isinstance(target, discord.Member):
+                await send_reply(message, "không tìm thấy thành viên đó trong server")
+                return
+            duration, label = parse_duration(prompt)
+            await target.timeout(duration, reason=reason)
+            await send_reply(message, f"đã mute {target.mention} trong {label}", ping=False)
+        else:
+            await message.guild.ban(target, reason=reason, delete_message_seconds=0)
+            await send_reply(message, f"đã ban {target} khỏi server", ping=False)
+    except discord.Forbidden:
+        await send_reply(message, "t thiếu quyền hoặc role của người đó cao hơn role t")
+    except discord.HTTPException as exc:
+        log.warning("Moderation failed: %s", exc)
+        await send_reply(message, "discord từ chối lệnh, kiểm tra quyền và role của t")
 
 
 def build_system(gid):
@@ -692,7 +773,7 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
     return clean_answer(text)
 
 
-async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
+async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks=None, force_thinking=False):
     """Chat có memory theo (channel, user)."""
     channel_id = key[0]
     is_girlfriend = key[1] == GIRLFRIEND_ID
@@ -738,10 +819,14 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
     speaker = "Nấm" if is_girlfriend else (user_name or "user")
     context_parts.append(f"[Câu {speaker} vừa nói với Zun]\n{prompt}")
     content = "\n\n".join(context_parts)
-    messages.append({"role": "user", "content": content})
+    if image_blocks:
+        user_content = list(image_blocks) + [{"type": "text", "text": content}]
+    else:
+        user_content = content
+    messages.append({"role": "user", "content": user_content})
     max_tokens = CODE_MAX_TOKENS if code_mode else CHAT_MAX_TOKENS
     temperature = 0.55 if code_mode else 0.9
-    thinking_budget = CODE_THINKING_BUDGET if code_mode else 0
+    thinking_budget = CODE_THINKING_BUDGET if code_mode else (OWNER_THINKING_BUDGET if force_thinking else 0)
     answer = await _claude(messages, max_tokens, temperature, thinking_budget)
 
     # Một lần sửa định dạng nếu model hứa đưa code nhưng chưa thực sự dán code.
@@ -934,6 +1019,92 @@ async def read_attachments(message):
     return "\n\n".join(parts)
 
 
+async def read_image_blocks(attachments):
+    """Đổi ảnh Discord thành content block cho Claude Vision."""
+    blocks = []
+    warnings = []
+    for att in attachments:
+        ext = os.path.splitext(att.filename.lower())[1]
+        media_type = IMAGE_MEDIA_TYPES.get(ext)
+        if not media_type:
+            continue
+        if att.size > MAX_IMAGE_BYTES:
+            warnings.append(f"[Ảnh {att.filename} quá 5MB nên bỏ qua]")
+            continue
+        try:
+            data = await att.read()
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(data).decode("ascii"),
+                },
+            })
+        except Exception as exc:
+            log.warning("Không đọc được ảnh %s: %s", att.filename, exc)
+            warnings.append(f"[Không đọc được ảnh {att.filename}]")
+    return blocks, "\n".join(warnings)
+
+
+def format_embed_for_analysis(embed):
+    parts = []
+    if embed.title:
+        parts.append(f"title={embed.title}")
+    if embed.description:
+        parts.append(f"description={embed.description[:800]}")
+    for field in embed.fields[:8]:
+        parts.append(f"{field.name}={str(field.value)[:400]}")
+    return " | ".join(parts)
+
+
+async def collect_bot_evidence(channel, target, limit=250, max_messages=40):
+    """Lấy bằng chứng công khai gần đây của bot trong đúng kênh đang phân tích."""
+    samples = []
+    try:
+        async for item in channel.history(limit=limit):
+            if item.author.id != target.id:
+                continue
+            body = (item.content or "").strip()
+            embeds = [format_embed_for_analysis(e) for e in item.embeds]
+            embeds = [e for e in embeds if e]
+            attachment_names = [a.filename for a in item.attachments]
+            details = [body[:1200]] if body else []
+            details += [f"embed: {e}" for e in embeds[:3]]
+            if attachment_names:
+                details.append("files: " + ", ".join(attachment_names[:8]))
+            if details:
+                samples.append(f"- {item.created_at.isoformat()}: " + " || ".join(details))
+            if len(samples) >= max_messages:
+                break
+    except discord.Forbidden:
+        return "[Zun thiếu quyền Read Message History trong kênh này]"
+    if not samples:
+        return "[Chưa thấy tin nhắn gần đây của bot này trong kênh]"
+    samples.reverse()
+    return "\n".join(samples)
+
+
+async def analyze_discord_bot(message, target):
+    evidence = await collect_bot_evidence(message.channel, target)
+    task = (
+        "Phân tích một Discord bot từ hồ sơ và các tin nhắn công khai được cung cấp. "
+        "Tóm tắt mục đích, cách tương tác, lệnh hoặc quy luật quan sát được, dữ liệu còn thiếu và rủi ro. "
+        "Chỉ kết luận điều có bằng chứng; đánh dấu rõ phần suy đoán. Không tuyên bố đã hiểu toàn bộ bot. "
+        "Không hướng dẫn spam, tự động farm tiền/điểm, né cooldown, captcha hay cơ chế chống lạm dụng."
+    )
+    roles = ", ".join(role.name for role in getattr(target, "roles", [])[1:]) or "không có"
+    user_content = (
+        f"Bot: {target} | id={target.id} | created={target.created_at.isoformat()}\n"
+        f"Roles trong server: {roles}\n"
+        f"Tin nhắn quan sát được trong kênh hiện tại:\n{evidence}"
+    )
+    return await ai_task(
+        get_gid(message), task, user_content,
+        max_tokens=1200, temperature=0.3, thinking_budget=OWNER_THINKING_BUDGET,
+    )
+
+
 # ==================== EVENTS ====================
 _synced = False
 
@@ -966,6 +1137,7 @@ async def on_message(message):
     is_ask = bool(re.match(r"^!ask(?:\s|$)", content, re.IGNORECASE))
     mentioned = bot.user in message.mentions
     wake = bool(ZUN_WAKE_RE.search(content))
+    prefix_moderation = bool(re.match(r"^\?(?:mute|ban)(?:\s|$)", content, re.IGNORECASE))
 
     # Resolve một lần để vừa nhận biết reply Zun, vừa dùng đúng tin gốc làm context.
     ref = None
@@ -980,7 +1152,7 @@ async def on_message(message):
                 pass
     reply_to_bot = bool(ref and bot.user and ref.author.id == bot.user.id)
 
-    if not (is_ask or mentioned or wake or reply_to_bot):
+    if not (is_ask or mentioned or wake or reply_to_bot or prefix_moderation):
         return
 
     key = (message.channel.id, message.author.id)
@@ -1009,6 +1181,38 @@ async def on_message(message):
     else:
         prompt = extract_prompt(message)
 
+    # Quyền nhạy cảm chỉ OWNER_ID: prefix ?mute/?ban hoặc câu tự nhiên "Zun mute/ban @user".
+    moderation_action = owner_moderation_action(message, prompt)
+    if moderation_action and (prefix_moderation or mentioned or wake or reply_to_bot):
+        await run_owner_moderation(message, moderation_action, prompt)
+        return
+
+    plain_prompt = normalize_chat_text(prompt)
+    if "thinking" in plain_prompt:
+        if not is_owner(message.author):
+            await send_reply(message, "chỉ chủ bot được đổi thinking")
+            return
+        gid_key = get_gid(message)
+        thinking_words = set(plain_prompt.split())
+        if thinking_words.intersection({"tat", "off", "dung"}):
+            thinking_guilds.discard(gid_key)
+            await send_reply(message, "đã tắt thinking")
+        elif thinking_words.intersection({"bat", "on", "mo"}):
+            thinking_guilds.add(gid_key)
+            await send_reply(message, "đã bật thinking cho các câu AI trong server này")
+        else:
+            state = "đang bật" if gid_key in thinking_guilds else "đang tắt"
+            await send_reply(message, f"thinking hiện {state}")
+        return
+
+    image_attachments = list(message.attachments)
+    if ref:
+        image_attachments += list(ref.attachments)
+    image_blocks, image_warning = await read_image_blocks(image_attachments)
+    if not prompt and image_blocks:
+        prompt = "phân tích và nhận xét ảnh này tự nhiên, nêu vật thể chính và chi tiết đáng chú ý"
+        plain_prompt = normalize_chat_text(prompt)
+
     # Chỉ khi bỏ wake word xong thật sự rỗng mới greeting.
     if not prompt:
         if on_quick_cooldown(message.channel.id, message.author.id):
@@ -1024,6 +1228,25 @@ async def on_message(message):
             choices = SNARKS if zun_variant_called(content) and mood == "lao" else GREETINGS
             reply = choose_short_reply(message.channel.id, choices)
         await send_reply(message, reply)
+        return
+
+    analysis_targets = [u for u in message.mentions if u != bot.user and u.bot]
+    if "phan tich" in plain_prompt and analysis_targets:
+        if not is_owner(message.author):
+            await send_reply(message, "tính năng phân tích bot chỉ chủ bot dùng được")
+            return
+        target = analysis_targets[0]
+        async with message.channel.typing():
+            try:
+                analysis = await analyze_discord_bot(message, target)
+                analysis = style_clean_answer(analysis, channel_id=message.channel.id, technical=True)
+                key_id = (get_gid(message), target.id)
+                bot_analyses[key_id] = analysis
+                latest_bot_analysis[get_gid(message)] = target.id
+                await send_reply_chunks(message, f"**phân tích {target.display_name}:**\n{analysis}")
+            except Exception as exc:
+                log.error("Bot analysis failed (%s)", type(exc).__name__)
+                await send_reply(message, claude_discord_error(exc))
         return
 
     # Intent chắc nghĩa trả lời tại chỗ, không gọi AI và không lệch chủ đề.
@@ -1066,11 +1289,34 @@ async def on_message(message):
     file_text = await read_attachments(message)
     if file_text:
         extra = (extra + "\n\n" + file_text).strip()
+    if image_warning:
+        extra = (extra + "\n\n" + image_warning).strip()
+
+    # Cho owner hỏi tiếp về bot vừa phân tích, nhưng chỉ tư vấn; không tự spam/farm bot khác.
+    if is_owner(message.author):
+        analyzed_bot_id = latest_bot_analysis.get(gid)
+        saved_analysis = bot_analyses.get((gid, analyzed_bot_id)) if analyzed_bot_id else None
+        if saved_analysis:
+            extra = (
+                extra
+                + "\n\n[Phân tích Discord bot đã lưu]\n"
+                + saved_analysis[:5000]
+                + "\nKhông tự gửi lệnh lặp, spam, farm tiền/điểm hoặc né cooldown của bot khác. "
+                  "Có thể gợi ý tối đa 3 lệnh để owner tự xem xét và tự gửi."
+            ).strip()
 
     log.info(f"AI call: {message.author} in #{message.channel}: {prompt[:60]!r}")
     async with message.channel.typing():
         try:
-            answer = await ai_chat(gid, key, prompt, extra_context=extra, user_name=message.author.display_name)
+            answer = await ai_chat(
+                gid,
+                key,
+                prompt,
+                extra_context=extra,
+                user_name=message.author.display_name,
+                image_blocks=image_blocks,
+                force_thinking=gid in thinking_guilds,
+            )
             await send_reply_chunks(message, answer)
         except Exception as e:
             log.error("Claude request failed in chat (%s)", type(e).__name__)
@@ -1147,6 +1393,11 @@ async def slash_reset(interaction: discord.Interaction):
 def build_help_text():
     return (
         "**Lệnh Zun:**\n"
+        "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
+        "`?ban @user [lý do]` ban, chỉ owner\n"
+        "`Zun bật/tắt thinking` chỉ owner\n"
+        "`Zun phân tích @bot` đọc hành vi gần đây của bot\n"
+        "Gọi Zun kèm ảnh hoặc reply ảnh để Zun nhìn và nhận xét\n"
         "`/ask` hỏi AI\n"
         "`/roast @user` khịa nhẹ\n"
         "`/mood` đổi mood admin\n"
