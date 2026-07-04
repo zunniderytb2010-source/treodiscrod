@@ -3121,6 +3121,85 @@ async def slash_unknown_word_phrases(interaction: discord.Interaction):
     save_unknown_word_phrases()
 
 
+def _flatten_dm_line(text):
+    """Ép tin nhắn về 1 dòng để giữ đúng format bảng."""
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def describe_dm_message(message):
+    """Nội dung tin + ghi chú ảnh/file để không mất dấu vết."""
+    parts = []
+    body = _flatten_dm_line(message.content)
+    if body:
+        parts.append(body)
+    if message.attachments:
+        parts.append("[" + ", ".join(a.filename for a in message.attachments) + "]")
+    if not parts and getattr(message, "embeds", None):
+        parts.append("[embed]")
+    return " ".join(parts) or "[tin trống]"
+
+
+def build_dm_conversation_report(messages, other_name):
+    """Ghép mỗi câu Zun với câu trả lời của người dùng theo format yêu cầu.
+
+    messages: danh sách theo thứ tự thời gian tăng dần.
+    """
+    lines = [
+        "TOÀN BỘ HỘI THOẠI DM VỚI ZUN",
+        f"Người chơi: {other_name}",
+        f"Tổng số tin: {len(messages)}",
+        "",
+        "--- HỘI THOẠI ---",
+    ]
+    pending_zun = None
+    for message in messages:
+        is_zun = bool(bot.user and message.author.id == bot.user.id)
+        text = describe_dm_message(message)
+        if is_zun:
+            if pending_zun is not None:
+                # Zun nói liên tiếp không ai trả lời: xả câu trước ra riêng.
+                lines.append(f"(zun): {pending_zun}")
+            pending_zun = text
+        else:
+            if pending_zun is not None:
+                lines.append(f"(zun): {pending_zun} | trả lời câu | {text} ({other_name})")
+                pending_zun = None
+            else:
+                lines.append(f"({other_name}): {text}")
+    if pending_zun is not None:
+        lines.append(f"(zun): {pending_zun}")
+    return "\n".join(lines) + "\n"
+
+
+@bot.tree.command(name="timhieu", description="Xuất toàn bộ hội thoại DM với Zun ra file (chỉ chủ bot, chỉ trong DM)")
+async def slash_timhieu(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
+        return
+    if interaction.guild is not None:
+        await interaction.response.send_message("lệnh này chỉ chạy trong DM riêng với t", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    channel = interaction.channel
+    if channel is None:
+        channel = interaction.user.dm_channel or await interaction.user.create_dm()
+    try:
+        messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+    except discord.HTTPException as exc:
+        log.warning("Không đọc được lịch sử DM: %s", exc)
+        await interaction.followup.send("t đọc lịch sử tin nhắn lỗi, thử lại sau")
+        return
+    if not messages:
+        await interaction.followup.send("chưa có tin nhắn nào trong DM này để xuất")
+        return
+    report = build_dm_conversation_report(messages, interaction.user.display_name).encode("utf-8")
+    attachment = discord.File(io.BytesIO(report), filename="hoi_thoai_zun.txt")
+    await interaction.followup.send(
+        f"đã gom {len(messages)} tin nhắn, file đây m",
+        file=attachment,
+    )
+
+
 def build_help_text():
     return (
         "**Lệnh Zun:**\n"
@@ -3130,6 +3209,7 @@ def build_help_text():
         "`mở máy` bật máy tính ảo Zun OS\n"
         "`/trade` chuyển tiền cho profile khác\n"
         "`/naptien` nạp tiền tùy ý, chỉ owner\n"
+        "`/timhieu` xuất hội thoại DM ra file, chỉ owner, dùng trong DM\n"
         "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
         "`?ban @user [lý do]` ban, chỉ owner\n"
         "`Zun bật/tắt thinking` chỉ owner\n"
