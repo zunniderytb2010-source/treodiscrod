@@ -39,7 +39,7 @@ MEMORY_MSGS = 60  # 30 luot user + 30 luot bot
 CHUNK_SIZE = 1900  # gioi han Discord 2000 ky tu/tin nhan
 CODE_MAX_TOKENS = 4096
 CHAT_MAX_TOKENS = 600
-THINKING_BUDGET = 1024  # token cho Claude suy nghi truoc khi tra loi (API bat buoc toi thieu 1024)
+CODE_THINKING_BUDGET = 2048  # chi code mode moi bat thinking; chat thuong tat de tra loi nhanh ~2s
 ALLOWED_EXT = (".txt", ".py", ".js", ".json", ".lua", ".md")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -633,13 +633,12 @@ def claude_discord_error(error):
     return random.choice(ERROR_EXCUSES)
 
 
-async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
+async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0):
     """Gọi Anthropic Messages API; SDK tự retry 429/5xx (max_retries mặc định 2).
 
-    Extended thinking đang bật nên:
-    - budget suy nghĩ phải cộng thêm vào max_tokens (thinking tính chung quota output)
-    - không được truyền temperature (API bắt buộc temperature mặc định khi thinking bật),
-      tham số temperature giữ trong signature cho tương thích chỗ gọi cũ nhưng không dùng.
+    thinking_budget > 0 thì bật extended thinking (nghĩ sâu, dùng cho code mode):
+    - budget phải cộng thêm vào max_tokens vì thinking tính chung quota output
+    - API cấm truyền temperature khi thinking bật nên chỉ truyền lúc thinking tắt.
     """
     system_parts = []
     claude_messages = []
@@ -649,12 +648,19 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
         else:
             claude_messages.append({"role": m["role"], "content": m["content"]})
 
+    extra = {}
+    if thinking_budget > 0:
+        extra["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        max_tokens += thinking_budget
+    else:
+        extra["temperature"] = temperature
+
     resp = await claude.messages.create(
         model=MODEL,
-        max_tokens=max_tokens + THINKING_BUDGET,
+        max_tokens=max_tokens,
         system="\n\n".join(system_parts),
         messages=claude_messages,
-        thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET},
+        **extra,
     )
     text = "".join(block.text for block in resp.content if block.type == "text")
     return clean_answer(text)
@@ -709,7 +715,8 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
     messages.append({"role": "user", "content": content})
     max_tokens = CODE_MAX_TOKENS if code_mode else CHAT_MAX_TOKENS
     temperature = 0.55 if code_mode else 0.9
-    answer = await _claude(messages, max_tokens, temperature)
+    thinking_budget = CODE_THINKING_BUDGET if code_mode else 0
+    answer = await _claude(messages, max_tokens, temperature, thinking_budget)
 
     # Một lần sửa định dạng nếu model hứa đưa code nhưng chưa thực sự dán code.
     if code_mode and requires_code_block(prompt) and "```" not in answer:
@@ -724,7 +731,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name=""):
                 ),
             },
         ]
-        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45)
+        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET)
 
     answer = ensure_code_fenced(answer, prompt) if code_mode else answer
     answer = style_clean_answer(
