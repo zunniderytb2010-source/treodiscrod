@@ -39,6 +39,7 @@ MEMORY_MSGS = 60  # 30 luot user + 30 luot bot
 CHUNK_SIZE = 1900  # gioi han Discord 2000 ky tu/tin nhan
 CODE_MAX_TOKENS = 4096
 CHAT_MAX_TOKENS = 600
+THINKING_BUDGET = 1024  # token cho Claude suy nghi truoc khi tra loi (API bat buoc toi thieu 1024)
 ALLOWED_EXT = (".txt", ".py", ".js", ".json", ".lua", ".md")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -633,7 +634,13 @@ def claude_discord_error(error):
 
 
 async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
-    """Gọi Anthropic Messages API; SDK tự retry 429/5xx (max_retries mặc định 2)."""
+    """Gọi Anthropic Messages API; SDK tự retry 429/5xx (max_retries mặc định 2).
+
+    Extended thinking đang bật nên:
+    - budget suy nghĩ phải cộng thêm vào max_tokens (thinking tính chung quota output)
+    - không được truyền temperature (API bắt buộc temperature mặc định khi thinking bật),
+      tham số temperature giữ trong signature cho tương thích chỗ gọi cũ nhưng không dùng.
+    """
     system_parts = []
     claude_messages = []
     for m in messages:
@@ -644,10 +651,10 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
 
     resp = await claude.messages.create(
         model=MODEL,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens + THINKING_BUDGET,
         system="\n\n".join(system_parts),
         messages=claude_messages,
-        temperature=temperature,
+        thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET},
     )
     text = "".join(block.text for block in resp.content if block.type == "text")
     return clean_answer(text)
