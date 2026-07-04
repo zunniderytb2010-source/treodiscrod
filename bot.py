@@ -2989,6 +2989,8 @@ async def on_message(message):
 
 # ==================== SLASH COMMANDS ====================
 @bot.tree.command(name="ask", description="Hỏi Zun")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(prompt="Câu hỏi của m")
 async def slash_ask(interaction: discord.Interaction, prompt: str):
     if on_cooldown(interaction.user.id, interaction.channel_id):
@@ -3099,6 +3101,8 @@ async def slash_deposit_money(
     name="cactukotrongtudien",
     description="Xuất các cụm nối từ ngoài từ điển (chỉ chủ bot)",
 )
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slash_unknown_word_phrases(interaction: discord.Interaction):
     if not is_owner(interaction.user):
         await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
@@ -3172,6 +3176,8 @@ def build_dm_conversation_report(messages, other_name):
 
 
 @bot.tree.command(name="timhieu", description="Xuất toàn bộ hội thoại DM với Zun ra file (chỉ chủ bot, chỉ trong DM)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
 async def slash_timhieu(interaction: discord.Interaction):
     if not is_owner(interaction.user):
         await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
@@ -3227,16 +3233,22 @@ def build_help_text():
 
 
 @bot.tree.command(name="helpzun", description="Hướng dẫn dùng Zun")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slash_helpzun(interaction: discord.Interaction):
     await interaction.response.send_message(build_help_text())
 
 
 @bot.tree.command(name="commands", description="Xem lệnh của Zun")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slash_commands(interaction: discord.Interaction):
     await interaction.response.send_message(build_help_text())
 
 
 @bot.tree.command(name="status", description="Tình trạng của Zun")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slash_status(interaction: discord.Interaction):
     if not is_owner_or_admin(interaction.user):
         await deny_interaction(interaction)
