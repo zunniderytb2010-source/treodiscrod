@@ -739,11 +739,12 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
-    # RESPONSE_MAP xếp cụm tự nhiên trước, phần sinh tự động nằm sau. Chỉ quét nhóm
-    # đầu, tránh từ cụt và hậu tố filler để ván chơi công bằng, dễ hiểu.
+    # RESPONSE_MAP xếp cụm tự nhiên trước, phần sinh tự động nằm sau nên chỉ quét
+    # nhóm đầu. Câu mở màn đã lọc dễ riêng; còn trong ván thì bot chơi khó:
+    # ưu tiên câu có từ cuối cụt để ép người chơi bí.
     candidates = candidates[:4]
-    non_dead = [item for item in candidates if item[2] not in word_game_dead_ends]
-    pool = non_dead or candidates
+    deadly = [item for item in candidates if item[2] in word_game_dead_ends]
+    pool = deadly or candidates
     natural = [item for item in pool if item[2] not in WORD_GAME_FILLER_WORDS]
     return random.choice(natural or pool)[0]
 
@@ -772,7 +773,8 @@ async def ai_word_game_fallback(last_word, used_phrases, used_required_words=Non
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
         f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
         f"Không dùng các cụm đã dùng: {used}.\n"
-        "Ưu tiên cụm tự nhiên, phổ biến và có thể nối tiếp.\n"
+        "Cụm phải tự nhiên, người Việt hiểu được, nhưng ưu tiên cụm có TỪ CUỐI "
+        "hiếm và khó nối tiếp để làm khó đối thủ.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
     messages = [
