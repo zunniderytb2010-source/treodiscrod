@@ -415,7 +415,7 @@ START_PHRASES = [
     "mức độ", "mừng tuổi", "mực khô", "mực nướng", "mực đen",
     "mực ống", "mỹ lệ", "mỹ nhân", "mỹ phẩm", "mỹ thuật",
     "nam tính", "name tag", "name xấu", "name đẹp", "nan giải",
-    "nay mưa", "nay nắng", "nay đây", "ngang hàng", "ngang qua",
+    "nay mai", "nay mưa", "nay nắng", "ngang hàng", "ngang qua",
     "ngang tàng", "nghe lén", "nghe ngóng", "nghe podcast", "nghe rõ",
     "nghi ngại", "nghi ngờ", "nghi vấn", "nghèo khó", "nghèo tiền",
     "nghệ nhân", "nghệ sĩ", "nghệ số", "nghệ thuật", "nghỉ học",
@@ -8314,7 +8314,7 @@ RESPONSE_MAP = {
     "xưa": ["xưa cũ", "xưa kia", "xưa nay", "xưa lắc"],
     "kia": ["kia kìa"],
     "nay": [
-        "nay đây", "nay mưa", "nay nắng", "nay khác", "nay code", "nay cũ", "nay cứng", "nay data",
+        "nay mai", "nay mưa", "nay nắng", "nay khác", "nay code", "nay cũ", "nay cứng", "nay data",
         "nay dở", "nay file", "nay fix", "nay game", "nay hay", "nay hỏng", "nay khó", "nay key",
     ],
     "lắc": ["lắc đầu", "lắc tay", "lắc xúc", "lắc xư"],

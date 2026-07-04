@@ -86,13 +86,13 @@ WORD_GAME_FILLER_WORDS = {
 }
 WORD_GAME_ALWAYS_VALID = {
     "ảnh nét", "ngọt lịm", "người ngợm", "nhiếc móc", "túi da", "móc túi", "hình ảnh",
-    "chụp hình",
+    "chụp hình", "đây đó", "nay mai", "nay mưa", "nay nắng",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
     "vong co", "phó trạng",
     "chừng nhí", "chừng núi", "cũng theo", "dòng phổ", "kìa kìa",
-    "mẻ nồi", "mẻ nếp", "nhóm sản", "trận w",
+    "mẻ nồi", "mẻ nếp", "nay đây", "nhóm sản", "trận w",
 }
 # Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
