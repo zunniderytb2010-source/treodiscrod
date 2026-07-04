@@ -59,6 +59,10 @@ IMAGE_MEDIA_TYPES = {
 GAME_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game_data.json")
 UNKNOWN_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unknown_word_phrases.json")
 WORD_GAME_TIMEOUT_SECONDS = 5 * 60
+WORD_GAME_TURN_SECONDS = 10
+WORD_GAME_MAX_STRIKES = 4
+# 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
+WORD_GAME_COUNT_EMOJIS = [f"{digit}️⃣" for digit in "0123456789"] + ["\U0001F51F"]
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
 FAIR_WORD_GAME_STARTS = (
@@ -888,12 +892,95 @@ def update_game_result(profile, won):
     save_game_data()
 
 
+def cancel_word_game_timer(session):
+    task = session.pop("timer_task", None)
+    if task is not None:
+        task.cancel()
+
+
+def start_word_game_timer(key, session, bot_message):
+    """Mỗi lần bot ra từ thì đếm 10 giây cho người chơi bằng emoji trên tin đó."""
+    cancel_word_game_timer(session)
+    if bot_message is None:
+        return
+    session["turn_id"] = session.get("turn_id", 0) + 1
+    session["timer_task"] = asyncio.create_task(
+        word_game_turn_countdown(key, session, session["turn_id"], bot_message)
+    )
+
+
+async def word_game_turn_countdown(key, session, turn_id, bot_message):
+    """Thả emoji đếm 10 -> 0 trên tin của bot; về 0 mà chưa nối thì xử thua luôn."""
+    start = time.monotonic()
+    previous = None
+    try:
+        for remaining in range(WORD_GAME_TURN_SECONDS, -1, -1):
+            delay = start + (WORD_GAME_TURN_SECONDS - remaining) - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if (
+                word_game_sessions.get(key) is not session
+                or session.get("turn_id") != turn_id
+                or session["state"] != "active"
+            ):
+                return
+            emoji = WORD_GAME_COUNT_EMOJIS[remaining]
+            try:
+                await bot_message.add_reaction(emoji)
+                if previous is not None:
+                    await bot_message.remove_reaction(previous, bot.user)
+            except discord.HTTPException:
+                pass
+            previous = emoji
+        async with word_game_locks[key]:
+            if (
+                word_game_sessions.get(key) is not session
+                or session.get("turn_id") != turn_id
+                or session["state"] != "active"
+            ):
+                return
+            session.pop("timer_task", None)
+            word_game_sessions.pop(key, None)
+            profile = game_profiles.get(str(key[1]))
+            if profile is None:
+                return
+            update_game_result(profile, won=False)
+            await bot_message.reply(
+                f"<@{key[1]}> hết 10 giây rồi\nm thua mất {session['bet']:,}đ\n"
+                f"số dư giờ: {profile['balance']:,}đ",
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            )
+    except asyncio.CancelledError:
+        raise
+    except discord.HTTPException as exc:
+        log.warning("Đếm giờ nối từ lỗi: %s", exc)
+
+
+async def register_word_game_strike(message, session, phrase_key):
+    """Từ sai/vô nghĩa không thua ngay: khịa tăng dần, đủ 4 lần trong ván mới xử thua."""
+    session["strikes"] = session.get("strikes", 0) + 1
+    strikes = session["strikes"]
+    if strikes >= WORD_GAME_MAX_STRIKES:
+        await finish_word_game_loss(message, session, "sai lần 4 rồi, hết cứu")
+        return
+    if strikes == 1:
+        text = f'từ "{phrase_key}" là cái deo j?'
+    elif strikes == 2:
+        text = f'"{phrase_key}" là cái j nữa?'
+    else:
+        text = "??"
+    session["updated_at"] = time.time()
+    sent = await send_reply(message, text, remember=False)
+    start_word_game_timer((message.channel.id, message.author.id), session, sent)
+
+
 async def finish_word_game_win(message, session):
     key = (message.channel.id, message.author.id)
     profile = game_profile_for(message.author)
     prize = session["bet"] * 2
     profile["balance"] += prize
     update_game_result(profile, won=True)
+    cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
     await send_reply(
         message,
@@ -906,6 +993,7 @@ async def finish_word_game_loss(message, session, reason=""):
     key = (message.channel.id, message.author.id)
     profile = game_profile_for(message.author)
     update_game_result(profile, won=False)
+    cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
     prefix = f"{reason}\n" if reason else ""
     await send_reply(
@@ -969,15 +1057,18 @@ async def handle_word_game_session(message, prompt, session):
             "last_word": words[-1],
             "used_phrases": {canonical_word_game_text(start_phrase)},
             "used_required_words": {words[-1]},
+            "strikes": 0,
             "started_at": now,
             "updated_at": now,
         })
-        await send_reply(
+        sent = await send_reply(
             message,
             f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hoặc đảo cụm cũ\n"
+            f"mỗi lượt m có 10 giây, sai từ 4 lần trong ván là thua\n"
             f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
             remember=False,
         )
+        start_word_game_timer((message.channel.id, message.author.id), session, sent)
         return
 
     phrase_key = canonical_word_game_text(prompt)
@@ -990,28 +1081,17 @@ async def handle_word_game_session(message, prompt, session):
             remember=False,
         )
         return
-    if len(words) != 2:
-        await finish_word_game_loss(message, session, "sai luật rồi, phải nói đúng 2 từ")
-        return
-    if words[0] != session["last_word"]:
-        await finish_word_game_loss(
-            message,
-            session,
-            f'sai luật rồi, phải bắt đầu bằng "{session["last_word"]}"',
-        )
-        return
-    if phrase_key in session["used_phrases"]:
-        await finish_word_game_loss(message, session, "cụm đó dùng rồi")
-        return
+    # Người chơi đã ra lượt thật, dừng đồng hồ 10 giây trong lúc chấm.
+    cancel_word_game_timer(session)
     used_required_words = session.setdefault("used_required_words", {session["last_word"]})
-    semantic_verdict = await judge_word_game_phrase(phrase_key, source="người chơi")
-    if semantic_verdict is False:
-        await send_reply(
-            message,
-            f'cụm "{phrase_key}" nghe không có nghĩa, đổi cụm khác bắt đầu bằng '
-            f'"{session["last_word"]}"; chưa tính thua',
-            remember=False,
-        )
+    if (
+        len(words) != 2
+        or words[0] != session["last_word"]
+        or phrase_key in session["used_phrases"]
+        or await judge_word_game_phrase(phrase_key, source="người chơi") is False
+    ):
+        # Sai chính tả, sai luật hay vô nghĩa đều tính strike, không thua ngay.
+        await register_word_game_strike(message, session, phrase_key)
         return
 
     session["used_phrases"].add(phrase_key)
@@ -1035,11 +1115,12 @@ async def handle_word_game_session(message, prompt, session):
     session["last_word"] = response_words[-1]
     session["updated_at"] = time.time()
 
-    await send_reply(
+    sent = await send_reply(
         message,
         f"hợp lệ\nt nối: {response}\nm nối tiếp bằng: {response_words[-1]}",
         remember=False,
     )
+    start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
 
 async def handle_word_game_intents(message, prompt, invoked, replied_message=None):
@@ -1102,6 +1183,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
                 "current_phrase": "",
                 "last_word": "",
                 "used_phrases": set(),
+                "strikes": 0,
                 "started_at": time.time(),
                 "updated_at": time.time(),
             }
