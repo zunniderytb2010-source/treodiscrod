@@ -78,6 +78,7 @@ WORD_GAME_FILLER_WORDS = {
 }
 WORD_GAME_ALWAYS_VALID = {
     "ảnh nét", "ngọt lịm", "người ngợm", "nhiếc móc", "túi da", "móc túi", "hình ảnh",
+    "chụp hình",
 }
 WORD_GAME_ALWAYS_INVALID = {
     "ngợm nhiếc", "đạc đồ", "hài bài", "lịm người", "ambient kính",
@@ -728,7 +729,6 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             len(words) == 2
             and words[0] == last_word
             and normalized not in used_phrases
-            and words[-1] not in used_required_words
             and not reverses_used_phrase(normalized, used_phrases)
         ):
             candidates.append((phrase, normalized, words[-1]))
@@ -755,7 +755,6 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
         len(words) != 2
         or words[0] != last_word
         or normalized in used_phrases
-        or words[-1] in (used_required_words or set())
         or reverses_used_phrase(normalized, used_phrases)
     ):
         return None
@@ -764,12 +763,10 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
 
 async def ai_word_game_fallback(last_word, used_phrases, used_required_words=None):
     used = ", ".join(sorted(used_phrases)[:WORD_GAME_MAX_AI_USED])
-    used_words = ", ".join(sorted(used_required_words or set()))
     prompt = (
         "Tìm 1 cụm nối từ tiếng Việt đúng 2 từ.\n"
         f'Cụm phải bắt đầu bằng từ: "{last_word}".\n'
         f"Không dùng các cụm đã dùng: {used}.\n"
-        f"Không kết thúc bằng các từ đã nối qua: {used_words}.\n"
         "Ưu tiên cụm tự nhiên, phổ biến và có thể nối tiếp.\n"
         "Chỉ trả về đúng cụm 2 từ, không giải thích. Nếu không nghĩ ra trả về PASS."
     )
@@ -976,7 +973,7 @@ async def handle_word_game_session(message, prompt, session):
         })
         await send_reply(
             message,
-            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hay quay vòng\n"
+            f"ok cược {bet:,}đ\nluật: đúng 2 từ, nối chữ cuối, không lặp hoặc đảo cụm cũ\n"
             f"t ra trước: {start_phrase}\nm nối từ bắt đầu bằng: {words[-1]}",
             remember=False,
         )
@@ -998,9 +995,6 @@ async def handle_word_game_session(message, prompt, session):
         await finish_word_game_loss(message, session, "cụm đó dùng rồi")
         return
     used_required_words = session.setdefault("used_required_words", {session["last_word"]})
-    if words[-1] in used_required_words:
-        await finish_word_game_loss(message, session, f'từ "{words[-1]}" đã nối qua rồi, không quay vòng')
-        return
     semantic_verdict = await judge_word_game_phrase(phrase_key, source="người chơi")
     if semantic_verdict is False:
         await send_reply(
