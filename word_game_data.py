@@ -12206,3 +12206,58 @@ for _key, _phrases in EXTRA_RESPONSES_6.items():
         if _phrase not in _bucket:
             _bucket.append(_phrase)
 DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP}
+
+# Bo sung tu ban xuat /cactukotrongtudien lan 5 (2026-07-05). Bo cum tuc.
+EXTRA_RESPONSES_7 = {
+    "bóc": ["bóc tem", "bóc lột", "bóc phốt"],
+    "bông": ["bông xù", "bông lau", "bông tuyết"],
+    "chào": ["chào hỏi", "chào cờ", "chào sân"],
+    "chột": ["chột mắt", "chột dạ"],
+    "cống": ["cống hiến", "cống rãnh", "cống nạp"],
+    "cứng": ["cứng nhắc", "cứng đầu", "cứng cỏi"],
+    "gỉ": ["gỉ sét"],
+    "han": ["han gỉ"],
+    "heo": ["heo nái", "heo rừng", "heo đất"],
+    "hiến": ["hiến tế", "hiến máu", "hiến kế"],
+    "hiệp": ["hiệp ước", "hiệp sĩ", "hiệp hội"],
+    "hỏi": ["hỏi han", "hỏi cung", "hỏi thăm"],
+    "kho": ["kho ruốc", "kho bãi", "kho báu"],
+    "khô": ["khô quắt", "khô hạn", "khô khan"],
+    "lễ": ["lễ cưới", "lễ hội", "lễ phép"],
+    "nghẽn": ["nghẽn cống", "nghẽn mạch"],
+    "nhắc": ["nhắc nhở", "nhắc tuồng"],
+    "nái": ["nái xề"],
+    "queo": ["queo quẹo"],
+    "quắt": ["quắt queo"],
+    "ruột": ["ruột thịt", "ruột gan", "ruột non"],
+    "ship": ["ship hàng"],
+    "tem": ["tem thư"],
+    "thui": ["thui chột"],
+    "thà": ["thà chết"],
+    "trưng": ["trưng bày", "trưng cầu"],
+    "tượng": ["tượng trưng", "tượng đài"],
+    "tắc": ["tắc nghẽn", "tắc đường", "tắc kè"],
+    "võ": ["võ hiệp", "võ sĩ", "võ thuật"],
+    "xin": ["xin chào", "xin lỗi", "xin phép"],
+    "xù": ["xù xì", "xù lông"],
+    "điếng": ["điếng người"],
+    "đánh": ["đánh đập", "đánh nhau", "đánh giá"],
+    "hoa": ["hoa hoét", "hoa hòe"],
+    "nguyên": ["nguyên đán"],
+    "cá": ["cá tính"],
+    "sáng": ["sáng sủa"],
+    "xì": ["xì xào"],
+    "mới": ["mới đây"],
+    "này": ["này em"],
+    "ăn": ["ăn tết"],
+}
+for _key, _phrases in EXTRA_RESPONSES_7.items():
+    _bucket = RESPONSE_MAP.setdefault(_key, [])
+    for _phrase in _phrases:
+        if _phrase not in _bucket:
+            _bucket.append(_phrase)
+# Xoa cum rac / lap tu giong het khoi tu dien.
+_JUNK = {"nhàng nhàng"}
+for _k, _v in list(RESPONSE_MAP.items()):
+    RESPONSE_MAP[_k] = [p for p in _v if p.lower().strip() not in _JUNK]
+DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP or RESPONSE_MAP[_word]}

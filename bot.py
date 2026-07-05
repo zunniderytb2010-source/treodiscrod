@@ -113,6 +113,11 @@ WORD_GAME_ALWAYS_INVALID = {
     "lạc long", "thoại mỹ", "mạch khê",
     # Rác sinh tự động và cụm ghép gượng.
     "ty con", "ty mẹ", "ty lớn", "mạng xã", "ngoằng ngoăng", "ngoằng ngoằng",
+    # Cụm rác từ đợt test 2026-07-05.
+    "nhàng nhàng", "nhàng hạ", "nhàng rỗi", "hòe hòe", "mắm mè",
+    "ngợm nghĩnh", "ngợm nghệch", "nhở việc", "nhở vuệc", "nàn nỉ",
+    "này thì", "queo queo", "queo ruốc", "sủa nhặng", "đán từ",
+    "xề la", "xề là", "xề và", "xề xề",
 }
 # Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
 WORD_GAME_BOT_AVOID_PHRASES = {
@@ -122,10 +127,10 @@ WORD_GAME_BOT_AVOID_PHRASES = {
 WORD_GAME_KILL_WORDS = {
     "ngoằng", "lự",
 }
-# Cụm chứa từ tục không được tính lượt, cả phía người chơi lẫn bot.
+# Cụm chứa từ tục/nhạy cảm không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
     "lồn", "loz", "cặc", "cak", "buồi", "đụ", "địt", "đéo", "đĩ", "điếm",
-    "cứt", "cức",
+    "cứt", "cức", "sex", "porn",
 }
 
 ACCOUNT_CONTEXT_BLOCKLIST = {
@@ -1180,6 +1185,7 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             and not reverses_used_phrase(normalized, used_phrases)
             and not any(word in WORD_GAME_BANNED_WORDS for word in words)
             and normalized not in WORD_GAME_BOT_AVOID_PHRASES
+            and words[0] != words[1]  # cấm bịa kiểu "nhàng nhàng", "queo queo"
         ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
@@ -1210,6 +1216,7 @@ def validate_ai_word_response(answer, last_word, used_phrases, used_required_wor
         or reverses_used_phrase(normalized, used_phrases)
         or any(word in WORD_GAME_BANNED_WORDS for word in words)
         or normalized in WORD_GAME_BOT_AVOID_PHRASES
+        or words[0] == words[1]  # AI không được bịa cụm lặp từ giống hệt
     ):
         return None
     return re.sub(r"\s+", " ", answer).strip().lower()
@@ -3206,6 +3213,80 @@ async def slash_timhieu(interaction: discord.Interaction):
     )
 
 
+HOCNAM_PER_CHANNEL_LIMIT = 5000  # tối đa tin lục mỗi kênh, tránh rate-limit
+
+
+def build_couple_report(collected, guild_name):
+    """collected: list (channel, created_at, author_name, author_id, text). Nhóm theo kênh, sắp theo giờ."""
+    by_channel = defaultdict(list)
+    for channel_name, created_at, author_name, author_id, text in collected:
+        by_channel[channel_name].append((created_at, author_name, text))
+    local_tz = datetime.timezone(datetime.timedelta(hours=7))
+    lines = [
+        "HỘI THOẠI CỦA CHỦ BOT VÀ NẤM TRONG SERVER",
+        f"Server: {guild_name}",
+        f"Tổng số tin: {len(collected)}",
+        "",
+    ]
+    for channel_name in sorted(by_channel):
+        lines.append(f"===== #{channel_name} =====")
+        for created_at, author_name, text in sorted(by_channel[channel_name], key=lambda x: x[0] or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)):
+            stamp = created_at.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S") if created_at else "?"
+            lines.append(f"[{stamp}] {author_name}: {text}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+@bot.tree.command(name="hocnam", description="Gom tin nhắn của m và Nấm trong server ra file, gửi DM riêng (chỉ chủ bot)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def slash_hocnam(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        await interaction.response.send_message("lệnh này chỉ chủ bot dùng được", ephemeral=True)
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("lệnh này chạy trong server", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    target_ids = {OWNER_ID, GIRLFRIEND_ID}
+    collected = []
+    scanned = 0
+    for channel in guild.text_channels:
+        perms = channel.permissions_for(guild.me)
+        if not (perms.read_messages and perms.read_message_history):
+            continue
+        try:
+            async for msg in channel.history(limit=HOCNAM_PER_CHANNEL_LIMIT, oldest_first=True):
+                if msg.author.id in target_ids:
+                    collected.append(
+                        (channel.name, msg.created_at, msg.author.display_name, msg.author.id, describe_dm_message(msg))
+                    )
+        except discord.HTTPException:
+            continue
+        scanned += 1
+    if not collected:
+        await interaction.followup.send(
+            "không gom được tin nào của m với Nấm trong server này (kiểm tra t có quyền đọc lịch sử kênh không)",
+            ephemeral=True,
+        )
+        return
+    report_bytes = build_couple_report(collected, guild.name).encode("utf-8")
+    try:
+        dm = interaction.user.dm_channel or await interaction.user.create_dm()
+        await dm.send(
+            f"gom {len(collected)} tin của m và Nấm trong {scanned} kênh ở **{guild.name}**",
+            file=discord.File(io.BytesIO(report_bytes), filename="hoi_thoai_nam.txt"),
+        )
+        await interaction.followup.send("xong, t gửi file vào DM cho m rồi", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            f"gom {len(collected)} tin nhưng DM lỗi (m mở DM cho t chưa?), gửi tạm ở đây",
+            file=discord.File(io.BytesIO(report_bytes), filename="hoi_thoai_nam.txt"),
+            ephemeral=True,
+        )
+
+
 def build_help_text():
     return (
         "**Lệnh Zun:**\n"
@@ -3216,6 +3297,7 @@ def build_help_text():
         "`/trade` chuyển tiền cho profile khác\n"
         "`/naptien` nạp tiền tùy ý, chỉ owner\n"
         "`/timhieu` xuất hội thoại DM ra file, chỉ owner, dùng trong DM\n"
+        "`/hocnam` gom tin của m và Nấm trong server, gửi DM riêng, chỉ owner\n"
         "`?mute @user [10m/2h/1d]` timeout, chỉ owner\n"
         "`?ban @user [lý do]` ban, chỉ owner\n"
         "`Zun bật/tắt thinking` chỉ owner\n"
