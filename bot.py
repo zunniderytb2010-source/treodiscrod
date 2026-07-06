@@ -31,6 +31,8 @@ GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "1197183310342914150"))
 # Cài Ollama rồi `ollama pull gemma3n:e4b`, để Ollama chạy nền ở cổng 11434.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))  # giây, lần đầu load model chậm
+# Nhả VRAM khi rảnh: model chỉ ở trong VRAM lúc có người dùng, rảnh quá số giây này là tự unload.
+OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_SECONDS", "30"))
 
 MODEL = os.getenv("GEMMA_MODEL", "gemma3n:e4b")
 ROAST_MODEL = os.getenv("ROAST_MODEL", MODEL)
@@ -891,6 +893,7 @@ async def graceful_shutdown():
             except discord.HTTPException:
                 pass
     finally:
+        await unload_gemma()  # trả VRAM cho máy khi tắt bot
         await bot.close()
 
 
@@ -2597,16 +2600,23 @@ def _to_ollama_messages(messages):
     return out
 
 
+_gemma_last_use = 0.0    # monotonic time lần cuối gọi model
+_gemma_loaded = False    # model có đang nằm trong VRAM không
+
+
 async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None):
     """Gọi model Gemma local qua Ollama (/api/chat). Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
 
     thinking_budget không dùng nữa (Gemma không có extended thinking); chỉ map
     temperature + num_predict. Ollama gộp system vào messages luôn.
+    keep_alive: model chỉ ở VRAM trong lúc còn người dùng, rảnh quá là Ollama tự nhả.
     """
+    global _gemma_last_use, _gemma_loaded
     payload = {
         "model": model or MODEL,
         "messages": _to_ollama_messages(messages),
         "stream": False,
+        "keep_alive": f"{OLLAMA_IDLE_UNLOAD_SECONDS}s",
         "options": {
             "temperature": temperature,
             "num_predict": max_tokens,
@@ -2617,8 +2627,33 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
         async with session.post(f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
             resp.raise_for_status()
             data = await resp.json()
+    _gemma_last_use = time.monotonic()
+    _gemma_loaded = True
     text = (data.get("message") or {}).get("content", "")
     return clean_answer(text)
+
+
+async def unload_gemma(model=None):
+    """Ép Ollama nhả model khỏi VRAM ngay (keep_alive=0). Gọi best-effort, lỗi thì thôi."""
+    payload = {"model": model or MODEL, "keep_alive": 0}
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"{OLLAMA_HOST}/api/generate", json=payload) as resp:
+                await resp.read()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        log.warning("Không nhả được VRAM Gemma: %s", exc)
+
+
+async def gemma_idle_unload_loop():
+    """Rảnh quá OLLAMA_IDLE_UNLOAD_SECONDS thì chủ động nhả VRAM và ghi log cho thấy rõ."""
+    global _gemma_loaded
+    while not bot.is_closed():
+        await asyncio.sleep(max(5, OLLAMA_IDLE_UNLOAD_SECONDS // 2))
+        if _gemma_loaded and time.monotonic() - _gemma_last_use > OLLAMA_IDLE_UNLOAD_SECONDS:
+            await unload_gemma()
+            _gemma_loaded = False
+            log.info("Gemma rảnh %ss, đã nhả VRAM cho máy", OLLAMA_IDLE_UNLOAD_SECONDS)
 
 
 async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks=None, force_thinking=False):
@@ -2977,6 +3012,7 @@ async def on_ready():
     if not _backup_started:
         _backup_started = True
         register_shutdown_handlers()
+        asyncio.create_task(gemma_idle_unload_loop())
         # Render chạy chồng instance khi deploy: chờ instance cũ báo bảo trì + đẩy
         # bản backup cuối rồi mới khôi phục, không thì đọc phải dữ liệu cũ.
         await asyncio.sleep(MAINTENANCE_RESTORE_DELAY_SECONDS)
