@@ -75,6 +75,13 @@ WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_START_BALANCE = 10_000
 WORD_GAME_MAX_AI_USED = 80
+# Kinh tế: điểm danh hằng ngày, vay tiền, nợ đỏ.
+DAILY_REWARD_BASE = 5_000
+DAILY_STREAK_BONUS = 1_000       # mỗi ngày streak +1k, tối đa 7 ngày
+DAILY_STREAK_MAX = 7
+DAILY_COOLDOWN_SECONDS = 24 * 60 * 60
+DAILY_STREAK_RESET_SECONDS = 48 * 60 * 60  # quá 2 ngày không điểm danh là mất streak
+LOAN_MAX_DEBT = 100_000          # trần nợ tối đa
 WORD_GAME_BLOCKED_OPENING_WORDS = {"bánh"}
 FAIR_WORD_GAME_STARTS = (
     "ăn cơm", "đi học", "chơi game", "làm việc", "uống nước", "đọc sách",
@@ -567,6 +574,9 @@ def _clean_game_profiles(raw):
                 "wins": wins,
                 "losses": losses,
                 "created_at": int(value.get("created_at", time.time())),
+                "last_daily": max(0, int(value.get("last_daily", 0))),
+                "daily_streak": max(0, int(value.get("daily_streak", 0))),
+                "debt": max(0, int(value.get("debt", 0))),
             }
         except (TypeError, ValueError, OverflowError):
             continue
@@ -957,6 +967,9 @@ def get_or_create_game_profile(user):
             "wins": 0,
             "losses": 0,
             "created_at": int(time.time()),
+            "last_daily": 0,
+            "daily_streak": 0,
+            "debt": 0,
         }
         game_profiles[user_id] = profile
         save_game_data()
@@ -976,12 +989,17 @@ def format_game_profile(profile, heading=None):
     rate = 0 if total == 0 else profile["wins"] / total * 100
     rate_text = f"{rate:.1f}".rstrip("0").rstrip(".")
     title = heading or f"profile của {profile['name']}"
-    return (
-        f"{title}\nlv.{profile['level']}\n"
-        f"tiền: {profile['balance']:,}đ\n"
-        f"thắng/thua: {profile['wins']}/{profile['losses']}\n"
-        f"tỉ lệ thắng: {rate_text}%"
-    )
+    lines = [
+        title,
+        f"lv.{profile['level']}",
+        f"tiền: {profile['balance']:,}đ",
+    ]
+    debt = int(profile.get("debt", 0))
+    if debt > 0:
+        lines.append(f"🔴 nợ: {debt:,}đ")
+    lines.append(f"thắng/thua: {profile['wins']}/{profile['losses']}")
+    lines.append(f"tỉ lệ thắng: {rate_text}%")
+    return "\n".join(lines)
 
 
 async def transfer_game_money(sender_user, receiver_user, amount):
@@ -1019,6 +1037,110 @@ async def deposit_game_money(target_user, amount):
         profile["name"] = target_user.display_name
         save_game_data()
         return None, profile["balance"]
+
+
+def _fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours} giờ {minutes} phút"
+    if minutes:
+        return f"{minutes} phút"
+    return f"{seconds} giây"
+
+
+async def claim_daily_reward(user):
+    """Điểm danh mỗi 24h, streak liên tục thì thưởng thêm. Nợ thì trừ vào nợ trước."""
+    async with balance_lock:
+        profile = game_profile_for(user)
+        if profile is None:
+            return "m chưa có tài khoản, ping t nói tạo tài khoản trước", None
+        now = int(time.time())
+        last = int(profile.get("last_daily", 0))
+        elapsed = now - last
+        if last and elapsed < DAILY_COOLDOWN_SECONDS:
+            wait = DAILY_COOLDOWN_SECONDS - elapsed
+            return f"điểm danh rồi, quay lại sau {_fmt_duration(wait)} nữa", None
+        streak = int(profile.get("daily_streak", 0))
+        streak = streak + 1 if last and elapsed <= DAILY_STREAK_RESET_SECONDS else 1
+        bonus = min(streak - 1, DAILY_STREAK_MAX - 1) * DAILY_STREAK_BONUS
+        reward = DAILY_REWARD_BASE + bonus
+        profile["daily_streak"] = streak
+        profile["last_daily"] = now
+        profile["name"] = user.display_name
+        # Có nợ thì tự cấn 1 nửa thưởng vào nợ cho đỡ ngập.
+        debt = int(profile.get("debt", 0))
+        auto_paid = 0
+        if debt > 0:
+            auto_paid = min(debt, reward // 2)
+            profile["debt"] = debt - auto_paid
+            profile["balance"] += reward - auto_paid
+        else:
+            profile["balance"] += reward
+        save_game_data()
+        return None, {
+            "reward": reward, "streak": streak, "bonus": bonus,
+            "auto_paid": auto_paid, "balance": profile["balance"],
+            "debt": profile["debt"],
+        }
+
+
+async def take_loan(user, amount):
+    """Vay tiền: cộng vào số dư, ghi nợ. Có trần nợ."""
+    if amount is None or amount <= 0:
+        return "vay bao nhiêu, ghi số ra đi", None
+    async with balance_lock:
+        profile = game_profile_for(user)
+        if profile is None:
+            return "m chưa có tài khoản, ping t nói tạo tài khoản trước", None
+        debt = int(profile.get("debt", 0))
+        if debt + amount > LOAN_MAX_DEBT:
+            room = LOAN_MAX_DEBT - debt
+            return f"nợ tối đa {LOAN_MAX_DEBT:,}đ thôi, m còn vay được {max(0, room):,}đ", None
+        profile["debt"] = debt + amount
+        profile["balance"] += amount
+        profile["name"] = user.display_name
+        save_game_data()
+        return None, {"amount": amount, "balance": profile["balance"], "debt": profile["debt"]}
+
+
+def amount_from_intent(plain):
+    """Bóc số tiền khỏi câu kiểu 'vay 5000', 'tra no 3k'; không có số thì None."""
+    match = re.search(r"\d[\d.,]*\s*(?:k|tr|trieu|nghin|ngan|d|dong)?", plain)
+    return parse_word_game_bet(match.group(0)) if match else None
+
+
+def format_daily_result(info):
+    lines = [f"điểm danh +{info['reward']:,}đ (streak {info['streak']} ngày)"]
+    if info["bonus"]:
+        lines.append(f"thưởng streak: +{info['bonus']:,}đ")
+    if info["auto_paid"]:
+        lines.append(f"tự cấn {info['auto_paid']:,}đ vào nợ")
+    lines.append(f"số dư: {info['balance']:,}đ")
+    if info["debt"]:
+        lines.append(f"🔴 nợ còn: {info['debt']:,}đ")
+    return "\n".join(lines)
+
+
+async def repay_loan(user, amount):
+    """Trả nợ từ số dư. amount None = trả hết trong khả năng."""
+    async with balance_lock:
+        profile = game_profile_for(user)
+        if profile is None:
+            return "m chưa có tài khoản, ping t nói tạo tài khoản trước", None
+        debt = int(profile.get("debt", 0))
+        if debt <= 0:
+            return "m có nợ đâu mà trả", None
+        pay = amount if amount and amount > 0 else min(debt, profile["balance"])
+        pay = min(pay, debt, profile["balance"])
+        if pay <= 0:
+            return f"m hết tiền trả nợ rồi, số dư {profile['balance']:,}đ, nợ {debt:,}đ", None
+        profile["balance"] -= pay
+        profile["debt"] = debt - pay
+        profile["name"] = user.display_name
+        save_game_data()
+        return None, {"paid": pay, "balance": profile["balance"], "debt": profile["debt"]}
 
 
 def parse_text_economy_amount(content):
@@ -1088,6 +1210,22 @@ def is_game_profile_request(plain):
         r"|tien cua (?:t|toi|tao|minh)|so du(?: cua (?:t|toi|tao|minh))?",
         plain,
     ))
+
+
+def is_daily_request(plain):
+    return bool(re.fullmatch(r"daily|diem danh|nhan daily|diem danh hang ngay", plain))
+
+
+def is_loan_request(plain):
+    return bool(re.match(r"(?:vay|muon tien|vay tien)\b", plain))
+
+
+def is_repay_request(plain):
+    return bool(re.match(r"(?:tra no|tra tien|tra nợ|gop no)\b", plain))
+
+
+def is_debt_request(plain):
+    return bool(re.fullmatch(r"(?:xem )?no|no cua (?:t|toi|tao|minh)|so no", plain))
 
 
 def is_word_game_request(plain):
@@ -1771,6 +1909,34 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
             profile, created = get_or_create_game_profile(message.author)
             heading = "tạo xong tài khoản cho m rồi" if created else "m có tài khoản rồi đây"
             await send_reply(message, format_game_profile(profile, heading), remember=False)
+            return True
+        if is_daily_request(plain):
+            error, info = await claim_daily_reward(message.author)
+            await send_reply(message, error or format_daily_result(info), remember=False)
+            return True
+        if is_loan_request(plain):
+            error, info = await take_loan(message.author, amount_from_intent(plain))
+            await send_reply(
+                message,
+                error or f"vay {info['amount']:,}đ ok\nsố dư: {info['balance']:,}đ\n🔴 nợ: {info['debt']:,}đ",
+                remember=False,
+            )
+            return True
+        if is_repay_request(plain):
+            error, info = await repay_loan(message.author, amount_from_intent(plain))
+            if error:
+                await send_reply(message, error, remember=False)
+            else:
+                tail = f"🔴 nợ còn: {info['debt']:,}đ" if info["debt"] else "hết nợ r, nhẹ nợ"
+                await send_reply(message, f"trả {info['paid']:,}đ nợ\nsố dư: {info['balance']:,}đ\n{tail}", remember=False)
+            return True
+        if is_debt_request(plain):
+            profile = game_profile_for(message.author)
+            if profile is None:
+                await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
+            else:
+                debt = int(profile.get("debt", 0))
+                await send_reply(message, f"🔴 nợ của m: {debt:,}đ" if debt else "m sạch nợ, ngon", remember=False)
             return True
         if is_game_profile_request(plain):
             profile = game_profile_for(message.author)
@@ -3149,6 +3315,43 @@ async def slash_deposit_money(
     )
 
 
+@bot.tree.command(name="daily", description="Điểm danh nhận tiền hằng ngày")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def slash_daily(interaction: discord.Interaction):
+    error, info = await claim_daily_reward(interaction.user)
+    await interaction.response.send_message(error or format_daily_result(info))
+
+
+@bot.tree.command(name="vay", description="Vay tiền game (ghi nợ, có trần)")
+@app_commands.describe(sotien="Số tiền muốn vay")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def slash_vay(interaction: discord.Interaction, sotien: int):
+    error, info = await take_loan(interaction.user, sotien)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"vay **{info['amount']:,}đ** ok\nsố dư: **{info['balance']:,}đ**\n🔴 nợ: **{info['debt']:,}đ**"
+    )
+
+
+@bot.tree.command(name="trano", description="Trả nợ game (để trống trả tối đa)")
+@app_commands.describe(sotien="Số tiền trả, bỏ trống để trả tối đa")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def slash_trano(interaction: discord.Interaction, sotien: int = 0):
+    error, info = await repay_loan(interaction.user, sotien if sotien > 0 else None)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    tail = f"🔴 nợ còn: **{info['debt']:,}đ**" if info["debt"] else "hết nợ r, nhẹ nợ"
+    await interaction.response.send_message(
+        f"trả **{info['paid']:,}đ** nợ\nsố dư: **{info['balance']:,}đ**\n{tail}"
+    )
+
+
 @bot.tree.command(
     name="cactukotrongtudien",
     description="Xuất các cụm nối từ ngoài từ điển (chỉ chủ bot)",
@@ -3338,6 +3541,8 @@ def build_help_text():
         "`Zun tạo tài khoản` mở profile game\n"
         "`Zun profile` xem tiền/thắng thua\n"
         "`Zun chơi nối từ` chơi nối từ đặt cược\n"
+        "`/daily` hoặc `daily` điểm danh nhận tiền\n"
+        "`/vay <số>` vay tiền, `/trano` trả nợ\n"
         "`mở máy` bật máy tính ảo Zun OS\n"
         "`/trade` chuyển tiền cho profile khác\n"
         "`/naptien` nạp tiền tùy ý, chỉ owner\n"
