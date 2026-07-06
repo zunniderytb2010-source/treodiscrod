@@ -1,6 +1,8 @@
+import ast
 import asyncio
 import base64
 import datetime
+import operator
 import io
 import json
 import logging
@@ -2397,6 +2399,79 @@ def normalize_chat_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Model nhỏ hay tính sai; toán đơn giản thì bot tự tính trong code cho luôn đúng.
+_MATH_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow, ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval_math(node):
+    if isinstance(node, ast.Expression):
+        return _safe_eval_math(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _MATH_OPS:
+        left, right = _safe_eval_math(node.left), _safe_eval_math(node.right)
+        if type(node.op) in (ast.Pow,) and (abs(right) > 100 or abs(left) > 1e6):
+            raise ValueError("số mũ quá lớn")
+        return _MATH_OPS[type(node.op)](left, right)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _MATH_OPS:
+        return _MATH_OPS[type(node.op)](_safe_eval_math(node.operand))
+    raise ValueError("biểu thức không hợp lệ")
+
+
+def try_eval_math(prompt):
+    """Trả về chuỗi kết quả nếu prompt là phép tính số học thuần, ngược lại None."""
+    expr = (prompt or "").strip().lower()
+    # Bỏ phần hỏi đuôi và đổi từ tiếng Việt/ký hiệu sang toán tử.
+    expr = re.sub(r"(bang|bằng)\s*(bao nhieu|bao nhiêu|may|mấy|nhieu|nhiêu)?\s*\??$", "", expr).strip()
+    expr = re.sub(r"[=?]+\s*$", "", expr).strip()
+    replacements = {
+        "cộng": "+", "cong": "+", "trừ": "-", "tru": "-",
+        "nhân": "*", "nhan": "*", "chia": "/", "mũ": "**", "mu": "**",
+        "x": "*", "×": "*", "·": "*", "÷": "/", "^": "**",
+    }
+    for word, sym in replacements.items():
+        expr = re.sub(rf"(?<=\d)\s*{re.escape(word)}\s*(?=[\d(])", sym, expr)
+        expr = expr.replace(f" {word} ", sym)
+    expr = expr.replace(",", ".")  # 3,5 -> 3.5
+    if not expr or not re.fullmatch(r"[\d\s+\-*/%().]+", expr):
+        return None
+    if not re.search(r"\d[\s]*[+\-*/%]", expr):  # phải có ít nhất 1 phép tính
+        return None
+    try:
+        result = _safe_eval_math(ast.parse(expr, mode="eval"))
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        return None
+    if isinstance(result, float):
+        if result.is_integer():
+            result = int(result)
+        else:
+            result = round(result, 6)
+    return str(result)
+
+
+FACTUAL_MARKERS = (
+    "la gi", "la j", "nghia la", "dinh nghia", "bao nhieu", "may", "tinh",
+    "tai sao", "vi sao", "the nao", "nhu the nao", "lam sao", "cach",
+    "ai la", "khi nao", "o dau", "cong thuc", "dich", "nghia cua",
+    "co phai", "dung khong", "khac nhau", "phan biet", "bang bao nhieu",
+)
+
+
+def is_factual_question(prompt):
+    """Câu hỏi kiến thức/thực tế cần trả lời ĐÚNG, không phải cà khịa."""
+    plain = normalize_chat_text(prompt)
+    if not plain or is_short_insult(prompt):
+        return False
+    if "?" in (prompt or "") and len(plain.split()) >= 2:
+        return True
+    return any(marker in plain for marker in FACTUAL_MARKERS)
+
+
 def has_code_action(text):
     raw = (text or "").lower()
     return any(action in raw for action in CODE_ACTION_WORDS)
@@ -2660,6 +2735,17 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     """Chat có memory theo (channel, user)."""
     channel_id = key[0]
     is_girlfriend = key[1] == GIRLFRIEND_ID
+
+    # Toán đơn giản: tự tính cho chắc đúng, model nhỏ hay tính sai/né.
+    if not image_blocks:
+        math_result = try_eval_math(prompt)
+        if math_result is not None:
+            flavor = ["", "", " nha", " dễ v", " đó", " ez"]
+            answer = f"{math_result}{random.choice(flavor)}"
+            memory[key].append({"role": "user", "content": prompt[:2000]})
+            memory[key].append({"role": "assistant", "content": answer[:2000]})
+            return answer
+
     has_code_file = bool(
         extra_context
         and re.search(r"\[Nội dung file [^\]]+\.(?:py|js|lua|json)\]", extra_context, re.IGNORECASE)
@@ -2690,6 +2776,14 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         )
     if bro_used_recently(channel_id):
         chat_rule += " Zun đã dùng từ bro gần đây nên câu này tuyệt đối không dùng bro."
+    factual = not code_mode and not help_mode and is_factual_question(prompt)
+    if factual:
+        chat_rule += (
+            "\n\nĐÂY LÀ CÂU HỎI KIẾN THỨC THẬT. Ưu tiên số 1 là trả lời ĐÚNG sự thật, "
+            "chính xác, đúng trọng tâm câu hỏi. Vẫn giữ giọng Zun ngắn gọn nhưng KHÔNG được né, "
+            "KHÔNG chế số liệu, KHÔNG trả lời random hay đổi chủ đề. Nếu là bài tính thì tính ra kết quả "
+            "cụ thể. Nếu thật sự không chắc thì nói thẳng 't không chắc' chứ đừng bịa."
+        )
     if is_girlfriend:
         chat_rule += "\n\n" + GF_MODE_PROMPT
         situation = nam_situation_context(prompt)
@@ -2711,7 +2805,13 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         user_content = content
     messages.append({"role": "user", "content": user_content})
     max_tokens = CODE_MAX_TOKENS if code_mode else CHAT_MAX_TOKENS
-    temperature = 0.55 if code_mode else 0.9
+    # Model nhỏ: câu hỏi thật thì hạ temperature cho ổn định/đúng, cà khịa mới để cao cho lầy.
+    if code_mode:
+        temperature = 0.55
+    elif factual:
+        temperature = 0.3
+    else:
+        temperature = 0.8
     thinking_budget = CODE_THINKING_BUDGET if code_mode else (OWNER_THINKING_BUDGET if force_thinking else 0)
     answer = await _claude(messages, max_tokens, temperature, thinking_budget)
 
