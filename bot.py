@@ -2576,9 +2576,15 @@ def sanitize_ai_output(text):
     return text
 
 
+def _strip_speaker_label(text):
+    # Model nhỏ hay lặp format transcript "zun: ..." / "mrzunniderrs: ..."; bỏ tiền tố đó.
+    return re.sub(r"^\s*(?:(?:zun\w*|mrzunniderrs)\s*[:：]\s*)+", "", text or "", flags=re.IGNORECASE)
+
+
 def clean_answer(text):
     """Bỏ dấu ngoặc kép model tự thêm bọc câu trả lời (lỗi kiểu: xin chào.")"""
     text = sanitize_ai_output(text).strip()
+    text = _strip_speaker_label(text)
     quotes = '"\u201c\u201d'
     # bọc nguyên câu trong ngoặc kép -> bỏ cả 2 đầu
     if len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
@@ -2586,7 +2592,8 @@ def clean_answer(text):
     # dấu " lẻ ở cuối câu -> cắt
     elif text and text[-1] in quotes and sum(text.count(q) for q in quotes) % 2 == 1:
         text = text[:-1].rstrip()
-    return text
+    # Nhãn có thể nằm trong ngoặc kép, bỏ lại lần nữa sau khi tháo ngoặc.
+    return _strip_speaker_label(text).strip()
 
 
 def style_clean_answer(text, channel_id=None, technical=False):
@@ -2764,7 +2771,8 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         "Nếu user hỏi thật thì trả lời thật. "
         "Không tự chuyển chủ đề. Không dùng câu greeting khi user đã nói nội dung. "
         "Không lặp lại nguyên văn hoặc gần giống câu Zun đã nói trong tin nhắn gần đây, đổi cả cách mở đầu. "
-        "Viết thường như đang nhắn tin, giọng tự nhiên đúng persona."
+        "Viết thường như đang nhắn tin, giọng tự nhiên đúng persona. "
+        "CHỈ viết đúng nội dung câu trả lời, TUYỆT ĐỐI không thêm tiền tố 'zun:' hay tên người nào trước câu."
     )
     if help_mode:
         chat_rule += (
@@ -3282,7 +3290,7 @@ async def on_message(message):
         await send_reply(message, reply)
         return
 
-    # Chỉ chặn câu chửi ngắn thuần tuý; có yêu cầu thật thì vẫn gọi AI.
+    # Câu chửi ngắn: để model tự đốp cho tự nhiên, không lặp; lỗi mới rơi về câu cứng.
     if is_short_insult(prompt):
         if on_quick_cooldown(message.channel.id, message.author.id):
             try:
@@ -3290,7 +3298,13 @@ async def on_message(message):
             except Exception:
                 pass
             return
-        await handle_short_insult(message, prompt)
+        try:
+            async with message.channel.typing():
+                answer = await ai_chat(gid, key, prompt, user_name=message.author.display_name)
+            await send_reply(message, answer)
+        except Exception as exc:
+            log.warning("AI đốp chửi ngắn lỗi (%s), dùng câu cứng", type(exc).__name__)
+            await handle_short_insult(message, prompt)
         return
 
     if on_cooldown(message.author.id, message.channel.id):
