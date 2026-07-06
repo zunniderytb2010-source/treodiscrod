@@ -13,9 +13,8 @@ import time
 import unicodedata
 from collections import defaultdict, deque
 
-import anthropic
+import aiohttp
 import discord
-from anthropic import AsyncAnthropic
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -28,16 +27,13 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1191954573200457758"))
 GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "1197183310342914150"))
 
 
-# Key Claude: ưu tiên ANTHROPIC_API_KEY, fallback GEMINI_API_KEY cho .env cũ.
-ANTHROPIC_API_KEY = (
-    os.getenv("ANTHROPIC_API_KEY")
-    or os.getenv("CLAUDE_API_KEY")
-    or os.getenv("GEMINI_API_KEY")
-    or ""
-).strip()
+# AI local: chạy Gemma qua Ollama trên máy chủ bot, không dùng API trả phí nữa.
+# Cài Ollama rồi `ollama pull gemma3n:e4b`, để Ollama chạy nền ở cổng 11434.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))  # giây, lần đầu load model chậm
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
-ROAST_MODEL = os.getenv("ROAST_MODEL", "claude-sonnet-5")
+MODEL = os.getenv("GEMMA_MODEL", "gemma3n:e4b")
+ROAST_MODEL = os.getenv("ROAST_MODEL", MODEL)
 MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
@@ -151,8 +147,6 @@ ACCOUNT_CONTEXT_BLOCKLIST = {
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("zun")
-
-claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY or None)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2573,53 +2567,57 @@ ERROR_EXCUSES = [
 
 
 def claude_discord_error(error):
-    if isinstance(error, anthropic.RateLimitError):
+    # Ollama tắt/chưa pull model thì báo kiểu người thật, không lộ lỗi kỹ thuật.
+    if isinstance(error, (aiohttp.ClientConnectorError, ConnectionError)):
         return random.choice(RATE_LIMIT_EXCUSES)
     return random.choice(ERROR_EXCUSES)
 
 
-# Model doi 4.6+ (sonnet-5, opus-4-6...): adaptive thinking tu bat, CAM temperature/budget_tokens.
-NEWGEN_MODEL_PREFIXES = ("claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-fable")
+def _to_ollama_messages(messages):
+    """Đổi list {role, content} (content có thể là block ảnh kiểu Anthropic) sang format Ollama."""
+    out = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": m["role"], "content": content})
+            continue
+        # content là list block: gom text + ảnh base64 cho message đa phương tiện.
+        texts, images = [], []
+        for block in content:
+            if block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif block.get("type") == "image":
+                data = block.get("source", {}).get("data")
+                if data:
+                    images.append(data)
+        entry = {"role": m["role"], "content": "\n".join(texts)}
+        if images:
+            entry["images"] = images
+        out.append(entry)
+    return out
 
 
 async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None):
-    """Gọi Anthropic Messages API; SDK tự retry 429/5xx (max_retries mặc định 2).
+    """Gọi model Gemma local qua Ollama (/api/chat). Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
 
-    Model cũ (Haiku 4.5): thinking_budget > 0 thì bật extended thinking,
-    budget cộng thêm vào max_tokens và không được truyền temperature.
-    Model đời 4.6+ : thinking adaptive tự chạy, API cấm temperature lẫn budget_tokens,
-    thinking_budget chỉ dùng làm chỗ dư trong max_tokens cho phần nghĩ.
+    thinking_budget không dùng nữa (Gemma không có extended thinking); chỉ map
+    temperature + num_predict. Ollama gộp system vào messages luôn.
     """
-    system_parts = []
-    claude_messages = []
-    for m in messages:
-        if m["role"] == "system":
-            system_parts.append(m["content"])
-        else:
-            claude_messages.append({"role": m["role"], "content": m["content"]})
-
-    use_model = model or MODEL
-    extra = {}
-    if use_model.startswith(NEWGEN_MODEL_PREFIXES):
-        if thinking_budget > 0:
-            # adaptive thinking tu bat khi khong truyen thinking; chi can du cho trong max_tokens
-            max_tokens += thinking_budget
-        else:
-            extra["thinking"] = {"type": "disabled"}  # chat thuong: tra loi lien khong nghi
-    elif thinking_budget > 0:
-        extra["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-        max_tokens += thinking_budget
-    else:
-        extra["temperature"] = temperature
-
-    resp = await claude.messages.create(
-        model=use_model,
-        max_tokens=max_tokens,
-        system="\n\n".join(system_parts),
-        messages=claude_messages,
-        **extra,
-    )
-    text = "".join(block.text for block in resp.content if block.type == "text")
+    payload = {
+        "model": model or MODEL,
+        "messages": _to_ollama_messages(messages),
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        },
+    }
+    timeout = aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    text = (data.get("message") or {}).get("content", "")
     return clean_answer(text)
 
 
@@ -3638,9 +3636,8 @@ def start_keepalive_server():
 # ==================== RUN ====================
 if not DISCORD_TOKEN:
     raise SystemExit("Thiếu DISCORD_TOKEN trong .env")
-if not ANTHROPIC_API_KEY:
-    raise SystemExit("Thiếu ANTHROPIC_API_KEY (hoặc CLAUDE_API_KEY) trong .env")
 
+log.info("AI local: Ollama %s, model %s (nhớ chạy Ollama + `ollama pull %s`)", OLLAMA_HOST, MODEL, MODEL)
 load_game_data()
 load_unknown_word_phrases()
 start_keepalive_server()
