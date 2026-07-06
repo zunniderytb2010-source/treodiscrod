@@ -29,15 +29,19 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1191954573200457758"))
 GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "1197183310342914150"))
 
 
-# AI local: chạy Gemma qua Ollama trên máy chủ bot, không dùng API trả phí nữa.
-# Cài Ollama rồi `ollama pull gemma3n:e4b`, để Ollama chạy nền ở cổng 11434.
+# AI local: chạy model qua Ollama trên máy chủ bot, không dùng API trả phí nữa.
+# Cài Ollama rồi `ollama pull qwen2.5-coder:14b`, để Ollama chạy nền ở cổng 11434.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))  # giây, lần đầu load model chậm
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))  # giây, model 14B load/generate chậm hơn
 # Nhả VRAM khi rảnh: model chỉ ở trong VRAM lúc có người dùng, rảnh quá số giây này là tự unload.
-OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_SECONDS", "30"))
+# 14B load lại chậm (~10-20s) nên để grace lâu hơn, tránh reload liên tục giữa các câu.
+OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_SECONDS", "90"))
 
-MODEL = os.getenv("GEMMA_MODEL", "gemma3n:e4b")
+# Env cũ GEMMA_MODEL vẫn dùng được cho tương thích .env cũ.
+MODEL = (os.getenv("OLLAMA_MODEL") or os.getenv("GEMMA_MODEL") or "qwen2.5-coder:14b").strip()
 ROAST_MODEL = os.getenv("ROAST_MODEL", MODEL)
+# qwen2.5-coder là text-only; model xem ảnh (llava, qwen2.5-vl...) thì set MODEL_VISION=1.
+MODEL_SUPPORTS_VISION = os.getenv("MODEL_VISION", "0") == "1"
 MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
@@ -2669,7 +2673,7 @@ def _to_ollama_messages(messages):
                 if data:
                     images.append(data)
         entry = {"role": m["role"], "content": "\n".join(texts)}
-        if images:
+        if images and MODEL_SUPPORTS_VISION:
             entry["images"] = images
         out.append(entry)
     return out
