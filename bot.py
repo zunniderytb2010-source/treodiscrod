@@ -29,19 +29,28 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1191954573200457758"))
 GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "1197183310342914150"))
 
 
-# AI local: chạy model qua Ollama trên máy chủ bot, không dùng API trả phí nữa.
-# Cài Ollama rồi `ollama pull qwen2.5-coder:14b`, để Ollama chạy nền ở cổng 11434.
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))  # giây, model 14B load/generate chậm hơn
-# Nhả VRAM khi rảnh: model chỉ ở trong VRAM lúc có người dùng, rảnh quá số giây này là tự unload.
-# 14B load lại chậm (~10-20s) nên để grace lâu hơn, tránh reload liên tục giữa các câu.
-OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_SECONDS", "90"))
+# AI: Gemini API với xoay nhiều key. Hết sạch key thì bot im, không trả lời.
+# Đặt trong .env: GEMINI_API_KEY=..., GEMINI_API_KEY2=..., GEMINI_API_KEY3=... (thêm bao nhiêu cũng được).
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "60"))
+GEMINI_KEY_COOLDOWN = int(os.getenv("GEMINI_KEY_COOLDOWN", "60"))  # giây nghỉ 1 key sau khi dính 429/quota
 
-# Env cũ GEMMA_MODEL vẫn dùng được cho tương thích .env cũ.
-MODEL = (os.getenv("OLLAMA_MODEL") or os.getenv("GEMMA_MODEL") or "qwen2.5-coder:14b").strip()
-ROAST_MODEL = os.getenv("ROAST_MODEL", MODEL)
-# qwen2.5-coder là text-only; model xem ảnh (llava, qwen2.5-vl...) thì set MODEL_VISION=1.
-MODEL_SUPPORTS_VISION = os.getenv("MODEL_VISION", "0") == "1"
+
+def _load_gemini_keys():
+    """Gom GEMINI_API_KEY, GEMINI_API_KEY1..30 từ .env, bỏ trùng, giữ thứ tự."""
+    keys, seen = [], set()
+    for name in ["GEMINI_API_KEY"] + [f"GEMINI_API_KEY{i}" for i in range(1, 31)]:
+        val = (os.getenv(name) or "").strip()
+        if val and val not in seen:
+            seen.add(val)
+            keys.append(val)
+    return keys
+
+
+GEMINI_KEYS = _load_gemini_keys()
+MODEL = GEMINI_MODEL
+ROAST_MODEL = os.getenv("ROAST_MODEL", GEMINI_MODEL)
 MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
@@ -899,7 +908,6 @@ async def graceful_shutdown():
             except discord.HTTPException:
                 pass
     finally:
-        await unload_gemma()  # trả VRAM cho máy khi tắt bot
         await bot.close()
 
 
@@ -2655,91 +2663,130 @@ ERROR_EXCUSES = [
 ]
 
 
+class AllKeysExhaustedError(Exception):
+    """Tất cả Gemini key đều hết lượt; bot im, không trả lời."""
+
+
 def claude_discord_error(error):
-    # Ollama tắt/chưa pull model thì báo kiểu người thật, không lộ lỗi kỹ thuật.
-    if isinstance(error, (aiohttp.ClientConnectorError, ConnectionError)):
+    # Hết key thường được chặn im từ pre-check; ca hiếm cạn giữa chừng thì cáo bận tự nhiên.
+    if isinstance(error, (AllKeysExhaustedError, aiohttp.ClientConnectorError, ConnectionError)):
         return random.choice(RATE_LIMIT_EXCUSES)
     return random.choice(ERROR_EXCUSES)
 
 
-def _to_ollama_messages(messages):
-    """Đổi list {role, content} (content có thể là block ảnh kiểu Anthropic) sang format Ollama."""
-    out = []
+# ---- Xoay Gemini key: key dính 429/quota bị nghỉ GEMINI_KEY_COOLDOWN giây ----
+_gemini_key_cooldown = {}   # key -> timestamp hết cooldown
+_gemini_key_index = 0       # con trỏ round-robin
+
+
+def available_gemini_keys():
+    now = time.time()
+    return [k for k in GEMINI_KEYS if _gemini_key_cooldown.get(k, 0) <= now]
+
+
+def gemini_keys_available():
+    return bool(available_gemini_keys())
+
+
+def _mark_key_exhausted(key):
+    _gemini_key_cooldown[key] = time.time() + GEMINI_KEY_COOLDOWN
+    log.warning("Gemini key ...%s hết lượt, nghỉ %ss", key[-4:], GEMINI_KEY_COOLDOWN)
+
+
+def _keys_in_rotation():
+    """Danh sách key còn dùng được, bắt đầu từ vị trí round-robin cho cân tải."""
+    keys = available_gemini_keys()
+    if not keys:
+        return []
+    start = _gemini_key_index % len(keys)
+    return keys[start:] + keys[:start]
+
+
+def _to_gemini_payload(messages):
+    """Đổi list {role, content} (có thể chứa block ảnh) sang body Gemini generateContent."""
+    system_parts = []
+    contents = []
     for m in messages:
-        content = m["content"]
-        if isinstance(content, str):
-            out.append({"role": m["role"], "content": content})
+        if m["role"] == "system":
+            system_parts.append(m["content"] if isinstance(m["content"], str) else "")
             continue
-        # content là list block: gom text + ảnh base64 cho message đa phương tiện.
-        texts, images = [], []
-        for block in content:
-            if block.get("type") == "text":
-                texts.append(block.get("text", ""))
-            elif block.get("type") == "image":
-                data = block.get("source", {}).get("data")
-                if data:
-                    images.append(data)
-        entry = {"role": m["role"], "content": "\n".join(texts)}
-        if images and MODEL_SUPPORTS_VISION:
-            entry["images"] = images
-        out.append(entry)
-    return out
+        role = "model" if m["role"] == "assistant" else "user"
+        content = m["content"]
+        parts = []
+        if isinstance(content, str):
+            parts.append({"text": content})
+        else:
+            for block in content:
+                if block.get("type") == "text":
+                    parts.append({"text": block.get("text", "")})
+                elif block.get("type") == "image":
+                    src = block.get("source", {})
+                    if src.get("data"):
+                        parts.append({"inline_data": {
+                            "mime_type": src.get("media_type", "image/png"),
+                            "data": src["data"],
+                        }})
+        contents.append({"role": role, "parts": parts})
+    body = {"contents": contents}
+    if system_parts:
+        body["system_instruction"] = {"parts": [{"text": "\n\n".join(p for p in system_parts if p)}]}
+    return body
 
 
-_gemma_last_use = 0.0    # monotonic time lần cuối gọi model
-_gemma_loaded = False    # model có đang nằm trong VRAM không
+# Bot cà khịa nhẹ; nới bộ lọc để đừng chặn oan, nhưng vẫn giữ mức chặn cao cho nội dung nặng.
+_GEMINI_SAFETY = [
+    {"category": c, "threshold": "BLOCK_ONLY_HIGH"} for c in (
+        "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
+]
 
 
 async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None):
-    """Gọi model Gemma local qua Ollama (/api/chat). Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
+    """Gọi Gemini API, xoay qua các key. Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
 
-    thinking_budget không dùng nữa (Gemma không có extended thinking); chỉ map
-    temperature + num_predict. Ollama gộp system vào messages luôn.
-    keep_alive: model chỉ ở VRAM trong lúc còn người dùng, rảnh quá là Ollama tự nhả.
+    thinking_budget bỏ (Gemini flash không có). Hết sạch key -> AllKeysExhaustedError.
     """
-    global _gemma_last_use, _gemma_loaded
-    payload = {
-        "model": model or MODEL,
-        "messages": _to_ollama_messages(messages),
-        "stream": False,
-        "keep_alive": f"{OLLAMA_IDLE_UNLOAD_SECONDS}s",
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        },
-    }
-    timeout = aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+    global _gemini_key_index
+    keys = _keys_in_rotation()
+    if not keys:
+        raise AllKeysExhaustedError()
+    body = _to_gemini_payload(messages)
+    body["generationConfig"] = {"temperature": temperature, "maxOutputTokens": max_tokens}
+    body["safetySettings"] = _GEMINI_SAFETY
+    use_model = model if (model and str(model).startswith("gemini")) else GEMINI_MODEL
+    timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT)
+    last_error = None
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    _gemma_last_use = time.monotonic()
-    _gemma_loaded = True
-    text = (data.get("message") or {}).get("content", "")
-    return clean_answer(text)
-
-
-async def unload_gemma(model=None):
-    """Ép Ollama nhả model khỏi VRAM ngay (keep_alive=0). Gọi best-effort, lỗi thì thôi."""
-    payload = {"model": model or MODEL, "keep_alive": 0}
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{OLLAMA_HOST}/api/generate", json=payload) as resp:
-                await resp.read()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        log.warning("Không nhả được VRAM Gemma: %s", exc)
-
-
-async def gemma_idle_unload_loop():
-    """Rảnh quá OLLAMA_IDLE_UNLOAD_SECONDS thì chủ động nhả VRAM và ghi log cho thấy rõ."""
-    global _gemma_loaded
-    while not bot.is_closed():
-        await asyncio.sleep(max(5, OLLAMA_IDLE_UNLOAD_SECONDS // 2))
-        if _gemma_loaded and time.monotonic() - _gemma_last_use > OLLAMA_IDLE_UNLOAD_SECONDS:
-            await unload_gemma()
-            _gemma_loaded = False
-            log.info("Gemma rảnh %ss, đã nhả VRAM cho máy", OLLAMA_IDLE_UNLOAD_SECONDS)
+        for key in keys:
+            url = f"{GEMINI_API_BASE}/{use_model}:generateContent?key={key}"
+            try:
+                async with session.post(url, json=body) as resp:
+                    if resp.status in (429, 403) or resp.status == 400:
+                        # 429 quota, 403 key hỏng/hết hạn, 400 key sai -> bỏ key này.
+                        detail = (await resp.text())[:200]
+                        last_error = f"{resp.status} {detail}"
+                        _mark_key_exhausted(key)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except aiohttp.ClientResponseError as exc:
+                last_error = str(exc)
+                if exc.status in (429, 403, 400, 500, 503):
+                    _mark_key_exhausted(key)
+                    continue
+                raise
+            # Thành công: nhớ vị trí kế cho lần sau, trả kết quả.
+            _gemini_key_index = (GEMINI_KEYS.index(key) + 1) % max(1, len(GEMINI_KEYS))
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return ""  # bị safety chặn hoặc rỗng
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts)
+            return clean_answer(text)
+    # Chạy hết vòng mà key nào cũng lỗi/hết.
+    log.warning("Tất cả Gemini key đều lỗi/hết: %s", last_error)
+    raise AllKeysExhaustedError()
 
 
 async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks=None, force_thinking=False):
@@ -3124,7 +3171,6 @@ async def on_ready():
     if not _backup_started:
         _backup_started = True
         register_shutdown_handlers()
-        asyncio.create_task(gemma_idle_unload_loop())
         # Render chạy chồng instance khi deploy: chờ instance cũ báo bảo trì + đẩy
         # bản backup cuối rồi mới khôi phục, không thì đọc phải dữ liệu cũ.
         await asyncio.sleep(MAINTENANCE_RESTORE_DELAY_SECONDS)
@@ -3195,6 +3241,8 @@ async def on_message(message):
     # ---- roast bằng ngôn ngữ tự nhiên: "zun roast @user", "ê zun khịa @user" ----
     targets = [u for u in message.mentions if u != bot.user]
     if (mentioned or wake or reply_to_bot) and targets and any(w in lowered for w in ROAST_WORDS):
+        if not gemini_keys_available():
+            return  # hết key thì im
         if on_cooldown(message.author.id, message.channel.id):
             await message.add_reaction("⏳")
             return
@@ -3263,6 +3311,8 @@ async def on_message(message):
         if not is_owner(message.author):
             await send_reply(message, "tính năng phân tích bot chỉ chủ bot dùng được")
             return
+        if not gemini_keys_available():
+            return  # hết key thì im
         target = analysis_targets[0]
         async with message.channel.typing():
             try:
@@ -3292,6 +3342,8 @@ async def on_message(message):
 
     # Câu chửi ngắn: để model tự đốp cho tự nhiên, không lặp; lỗi mới rơi về câu cứng.
     if is_short_insult(prompt):
+        if not gemini_keys_available():
+            return  # hết key thì im
         if on_quick_cooldown(message.channel.id, message.author.id):
             try:
                 await message.add_reaction("⏳")
@@ -3306,6 +3358,9 @@ async def on_message(message):
             log.warning("AI đốp chửi ngắn lỗi (%s), dùng câu cứng", type(exc).__name__)
             await handle_short_insult(message, prompt)
         return
+
+    if not gemini_keys_available():
+        return  # hết sạch key thì bot im, không trả lời tin nào cần AI
 
     if on_cooldown(message.author.id, message.channel.id):
         await message.add_reaction("⏳")
@@ -3363,6 +3418,9 @@ async def on_message(message):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(prompt="Câu hỏi của m")
 async def slash_ask(interaction: discord.Interaction, prompt: str):
+    if not gemini_keys_available():
+        await interaction.response.send_message("t hết lượt ai r, tí nữa hỏi lại", ephemeral=True)
+        return
     if on_cooldown(interaction.user.id, interaction.channel_id):
         await interaction.response.send_message("từ từ m spam quá, nghỉ xíu r hỏi", ephemeral=True)
         return
@@ -3384,6 +3442,9 @@ async def slash_ask(interaction: discord.Interaction, prompt: str):
 async def slash_roast(interaction: discord.Interaction, user: discord.Member):
     if user.id == bot.user.id:
         await interaction.response.send_message("tự roast t à, ez, t hoàn hảo r khịa j")
+        return
+    if not gemini_keys_available():
+        await interaction.response.send_message("t hết lượt ai r, tí nữa khịa", ephemeral=True)
         return
     if on_cooldown(interaction.user.id, interaction.channel_id):
         await interaction.response.send_message("từ từ m spam quá, nghỉ xíu r hỏi", ephemeral=True)
@@ -3790,8 +3851,10 @@ def start_keepalive_server():
 # ==================== RUN ====================
 if not DISCORD_TOKEN:
     raise SystemExit("Thiếu DISCORD_TOKEN trong .env")
+if not GEMINI_KEYS:
+    raise SystemExit("Thiếu GEMINI_API_KEY trong .env (thêm GEMINI_API_KEY, GEMINI_API_KEY2...)")
 
-log.info("AI local: Ollama %s, model %s (nhớ chạy Ollama + `ollama pull %s`)", OLLAMA_HOST, MODEL, MODEL)
+log.info("AI: Gemini model %s, %s key trong xoay vòng", GEMINI_MODEL, len(GEMINI_KEYS))
 load_game_data()
 load_unknown_word_phrases()
 start_keepalive_server()
