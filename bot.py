@@ -151,6 +151,9 @@ WORD_GAME_BOT_AVOID_PHRASES = {
 # Từ đuôi gần như không có đường nối chuẩn: nước gài chết, bot ƯU TIÊN ra để ép thua.
 WORD_GAME_KILL_WORDS = {
     "ngoằng", "lự",
+    # Từ tượng thanh / hiếm, người chơi gần như không nối tiếp được (bot phải RA được).
+    "khè", "rụm", "quèo", "quắp", "oạch", "rẹt", "xoẹt", "choẹt", "bùm",
+    "hoắc", "khét", "tịt", "xịt", "biếc", "nần", "đơ", "quắt", "rít", "toác",
 }
 # Cụm chứa từ tục/nhạy cảm không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -1338,6 +1341,24 @@ def reverses_used_phrase(phrase, used_phrases):
     return len(words) == 2 and f"{words[1]} {words[0]}" in used_phrases
 
 
+def _player_continuation_count(word, used_phrases, cap=10):
+    """Đếm sơ bộ số cụm NGƯỜI CHƠI còn nối được từ 'word' trong từ điển; càng ít họ càng dễ bí."""
+    count = 0
+    for phrase in word_game_response_map.get(word, []):
+        normalized = canonical_word_game_text(phrase)
+        w = normalized.split()
+        if (
+            len(w) == 2 and w[0] == word and w[0] != w[1]
+            and normalized not in used_phrases
+            and not reverses_used_phrase(normalized, used_phrases)
+            and not any(x in WORD_GAME_BANNED_WORDS for x in w)
+        ):
+            count += 1
+            if count >= cap:
+                break
+    return count
+
+
 def choose_dictionary_word_response(last_word, used_phrases, used_required_words=None):
     ensure_word_game_dictionary()
     used_required_words = used_required_words or set()
@@ -1357,15 +1378,28 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
-    # RESPONSE_MAP xếp cụm tự nhiên trước, phần sinh tự động nằm sau nên chỉ quét
-    # nhóm đầu. Câu mở màn đã lọc dễ riêng; còn trong ván bot chơi độ khó max:
-    # ưu tiên nước gài chết (từ cuối tuyệt đường), rồi tới từ cuối cụt thường.
-    candidates = candidates[:4]
-    killers = [item for item in candidates if item[2] in WORD_GAME_KILL_WORDS]
-    deadly = killers or [item for item in candidates if item[2] in word_game_dead_ends]
-    pool = deadly or candidates
-    natural = [item for item in pool if item[2] not in WORD_GAME_FILLER_WORDS]
-    return random.choice(natural or pool)[0]
+
+    # Bỏ hậu tố filler nếu còn lựa chọn tự nhiên khác.
+    non_filler = [c for c in candidates if c[2] not in WORD_GAME_FILLER_WORDS]
+    pool = non_filler or candidates
+
+    # LOOK-AHEAD: chấm mỗi đáp án = số đường người chơi còn nối từ 'từ cuối' của nó.
+    # Nước gài chết (từ cuối tuyệt đường) coi như âm để ưu tiên tuyệt đối. Càng thấp càng bóp.
+    def hardness(item):
+        end = item[2]
+        if end in WORD_GAME_KILL_WORDS:
+            return -1
+        base = _player_continuation_count(end, used_phrases | {item[1]})
+        # Từ cuối cụt/hiếm khó cho người chơi hơn -> ưu tiên nhẹ.
+        if end in word_game_dead_ends:
+            base -= 1
+        return base
+
+    scored = sorted(((hardness(c), c) for c in pool), key=lambda x: x[0])
+    best = scored[0][0]
+    # Lấy nhóm khó ngang (chênh tối đa 1 bậc) rồi random trong tối đa 6 câu cho đỡ đoán trước.
+    hardest = [c for score, c in scored if score <= best + 1]
+    return random.choice(hardest[:6])[0]
 
 
 def validate_ai_word_response(answer, last_word, used_phrases, used_required_words=None):

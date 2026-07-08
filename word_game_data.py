@@ -12325,3 +12325,58 @@ for _k, _phrases in EXTRA_RESPONSES_8.items():
         if _p not in _bucket:
             _bucket.append(_p)
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Va cho bot bi ket + them nuoc gai (2026-07-07 batch 7).
+EXTRA_RESPONSES_9 = {
+    "chí": ["chí khí", "chí hướng", "chí lớn"],
+    "đội": ["đội hình", "đội trưởng", "đội bóng", "đội quân"],
+    "thực": ["thực đơn", "thực phẩm", "thực tế", "thực vật"],
+    "họ": ["họ hàng", "họ tộc"],
+    "cực": ["cực khổ", "cực đoan", "cực hạn"],
+    "bắc": ["bắc cầu", "bắc thang"],
+    "hứng": ["hứng thú", "hứng khởi"],
+    "loại": ["loại bỏ", "loại trừ", "loại hình"],
+    "xóm": ["xóm làng", "xóm giềng"],
+    "dán": ["dán tem", "dán keo", "dán nhãn"],
+    "cùng": ["cùng nhau", "cùng lúc"],
+    "son": ["son môi", "son phấn"],
+    "cả": ["cả nhà", "cả ngày", "cả đời"],
+    "đủ": ["đủ đầy", "đủ dùng"],
+    "thuyết": ["thuyết phục", "thuyết minh", "thuyết trình"],
+    "chắc": ["chắc chắn", "chắc nịch"],
+    "mang": ["mang thai", "mang vác", "mang ơn"],
+    "tới": ["tới nơi", "tới tấp", "tới bến"],
+    "cung": ["cung điện", "cung cấp", "cung tên"],
+    "thù": ["thù hằn", "thù địch", "thù lao"],
+    "chức": ["chức năng", "chức vụ", "chức danh"],
+    "can": ["can đảm", "can thiệp", "can ngăn"],
+    "điên": ["điên cuồng", "điên đảo", "điên rồ"],
+    "báu": ["báu vật"],
+    "kiến": ["kiến trúc", "kiến thức", "kiến nghị"],
+    "hạnh": ["hạnh phúc", "hạnh kiểm"],
+    "kiện": ["kiện tụng", "kiện toàn"],
+    "xúc": ["xúc động", "xúc cảm", "xúc tiến"],
+    "bom": ["bom tấn", "bom mìn"],
+    "mộc": ["mộc mạc", "mộc nhĩ"],
+    "canh": ["canh gác", "canh giữ", "canh chua"],
+    "mẹo": ["mẹo vặt"],
+    "kế": ["kế hoạch", "kế toán", "kế thừa", "kế tiếp"],
+    "thừa": ["thừa kế", "thừa nhận", "thừa thãi"],
+    "bảng": ["bảng điểm", "bảng vàng", "bảng hiệu"],
+    "quanh": ["quanh co", "quanh quẩn", "quanh năm"],
+    "kéo": ["kéo dài", "kéo co", "kéo lê"],
+    "nén": ["nén nhang", "nén lòng"],
+    "kiệt": ["kiệt sức", "kiệt tác", "kiệt quệ"],
+    "thuộc": ["thuộc bài", "thuộc lòng", "thuộc địa"],
+    "đục": ["đục khoét", "đục ngầu"],
+    "quắp": ["quắp đuôi"],
+    "trệ": ["trệ nải"],
+    "nghếch": ["nghếch mắt"],
+    "thuyền": ["thuyền chài", "thuyền rồng", "thuyền trưởng"],
+}
+for _k, _phrases in EXTRA_RESPONSES_9.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
