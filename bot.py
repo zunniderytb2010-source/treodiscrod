@@ -154,11 +154,9 @@ WORD_GAME_BOT_AVOID_PHRASES = {
 }
 # Từ đuôi gần như không có đường nối chuẩn: nước gài chết, bot ƯU TIÊN ra để ép thua.
 WORD_GAME_KILL_WORDS = {
-    "ngoằng", "lự",
-    # Từ TUYỆT ĐƯỜNG NỐI thật sự (không có cụm nào bắt đầu bằng nó). Đã loại các từ
-    # tưởng cụt mà thực ra nối được (khét lẹt, xịt keo, đơ máy, rít lên, quắp đuôi...).
-    "khè", "rụm", "quèo", "oạch", "rẹt", "xoẹt", "choẹt", "bùm",
-    "hoắc", "biếc", "nần", "toác", "tợn",
+    # Từ TUYỆT ĐƯỜNG NỐI thật sự mà bot RA được bằng cụm HỢP LỆ (dài ngoằng, giòn rụm,
+    # lưỡng lự, táo tợn). Đã bỏ khè/quèo/oạch... vì chỉ ra được bằng cụm rác (đã dọn).
+    "ngoằng", "lự", "rụm", "tợn",
 }
 # Cụm chứa từ tục/nhạy cảm không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -1513,11 +1511,13 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         {"role": "user", "content": prompt},
     ]
     try:
-        verdict = await _claude(messages, max_tokens=8, temperature=0, thinking_budget=0)
+        verdict = await _claude(messages, max_tokens=24, temperature=0, thinking_budget=0)
     except Exception as exc:
-        log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
+        # AI hỏng/hết key: KHÔNG xử oan người chơi (mất tiền thật). Cho qua, chỉ chặn được
+        # garbage rõ ràng ở bộ lọc cứng phía trên (ALWAYS_INVALID, lặp từ, tục).
+        log.warning("AI kiểm nghĩa nối từ lỗi (%s), cho qua", type(exc).__name__)
         record_unknown_word_phrase(canonical, source)
-        return False  # AI hỏng/hết key: không xác nhận được -> xử strike, không cho qua bừa
+        return True
     parsed = _parse_word_game_verdict(verdict)
     if parsed is True:
         valid = True
@@ -1540,18 +1540,19 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
             },
         ]
         try:
-            recheck = await _claude(recheck_messages, max_tokens=8, temperature=0, thinking_budget=0)
+            recheck = await _claude(recheck_messages, max_tokens=24, temperature=0, thinking_budget=0)
         except Exception:
             record_unknown_word_phrase(canonical, source)
-            return False
+            return True  # recheck hỏng: cho qua, không xử oan
         rechecked = _parse_word_game_verdict(recheck)
         if rechecked is None:
             record_unknown_word_phrase(canonical, source)
-            return False
-        valid = rechecked
+            return True  # recheck mơ hồ: cho qua
+        valid = rechecked  # chỉ reject khi AI khẳng định INVALID cả 2 lần
     else:
+        # Lần đầu AI trả mơ hồ (không rõ VALID/INVALID): cho qua, không xử oan.
         record_unknown_word_phrase(canonical, source)
-        return False
+        return True
     word_game_validity_cache[canonical] = valid
     record_unknown_word_phrase(canonical, source, valid)
     return valid

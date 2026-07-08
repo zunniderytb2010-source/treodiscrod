@@ -12640,3 +12640,38 @@ for _junk in ["tợn ghê", "tợn tệ"]:
     for _k in list(RESPONSE_MAP):
         RESPONSE_MAP[_k] = [_p for _p in RESPONSE_MAP[_k] if _p != _junk]
 RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
+
+# ==================== DON RAC AUTO-GEN (2026-07-09) ====================
+# Bo cac cum ket thuc o hau to vo nghia (sua queo, sua ngao, sua toang...) da lam
+# tu dien o nhiem, khien nguoi choi lan bot dung tu rac.
+_GARBAGE_ENDINGS = {
+    "toang","hẻo","lỏm","hẩm","bét","nhão","hốc","lụt","ngáo","ngố",
+    "sượng","khựng","quặt","quắp","oạch","rẹt","xoẹt","choẹt","lốp","bốp",
+    "đùng","bùm","khè","quèo","rụm","ngoằng","toác","hoắc","ù","ầm",
+    "rền","lụi","lì","xịt","hoẻn","khặc","nhẽo","beng","choang",
+}
+def _last_word(_p):
+    _ws = _p.strip().split()
+    return _ws[-1].lower() if len(_ws) == 2 else ""
+for _k in list(RESPONSE_MAP):
+    RESPONSE_MAP[_k] = [_p for _p in RESPONSE_MAP[_k] if _last_word(_p) not in _GARBAGE_ENDINGS]
+RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
+
+# Tai tao vai cum gai chet HOP LE (bot dung lam bay that su).
+_KILL_VALID = {
+    "dài": ["dài ngoằng"], "giòn": ["giòn rụm"], "lưỡng": ["lưỡng lự"],
+    "táo": ["táo tợn"], "dữ": ["dữ tợn"], "hung": ["hung tợn"],
+}
+# Them tu dung tu van bi xu oan + sua.
+_FIX = {
+    "sữa": ["sữa tắm", "sữa bột", "sữa bỉm", "sữa non"],
+    "tắm": ["tắm rửa", "tắm biển", "tắm nắng"],
+    "bỉm": ["bỉm sữa"],
+}
+for _src in (_KILL_VALID, _FIX):
+    for _k, _phrases in _src.items():
+        _bucket = RESPONSE_MAP.setdefault(_k, [])
+        for _p in _phrases:
+            if _p not in _bucket:
+                _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
