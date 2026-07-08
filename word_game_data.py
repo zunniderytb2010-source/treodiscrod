@@ -12261,3 +12261,67 @@ _JUNK = {"nhàng nhàng"}
 for _k, _v in list(RESPONSE_MAP.items()):
     RESPONSE_MAP[_k] = [p for p in _v if p.lower().strip() not in _JUNK]
 DEAD_END_WORDS = {_word for _word in DEAD_END_WORDS if _word not in RESPONSE_MAP or RESPONSE_MAP[_word]}
+
+# Bo sung tu ban xuat /cactukotrongtudien lan 6 (2026-07-07). Gom ca tu dung bi AI cham sai.
+EXTRA_RESPONSES_8 = {
+    "bìa": ["bìa dày", "bìa cứng"],
+    "chuyện": ["chuyện trò", "chuyện phiếm"],
+    "chó": ["chó hoang", "chó kiểng"],
+    "cổ": ["cổ xưa"],
+    "danh": ["danh vọng"],
+    "hót": ["hót vang", "hót líu lo"],
+    "học": ["học hỏi", "học tập"],
+    "lè": ["lè nhè", "lè lưỡi"],
+    "mai": ["mai hoa", "mai kia"],
+    "ngạt": ["ngạt thở", "ngạt mũi"],
+    "nhè": ["nhè nhẹ"],
+    "sen": ["sen vàng"],
+    "tĩnh": ["tĩnh lặng", "tĩnh tâm"],
+    "tươi": ["tươi tắn"],
+    "vang": ["vang danh", "vang dội", "vang vọng"],
+    "vẻ": ["vẻ vang"],
+    "xanh": ["xanh lét"],
+    "óng": ["óng mượt", "óng ả"],
+    "động": ["động thái"],
+    "bài": ["bài vở"],
+    "báo": ["báo chí", "báo đài"],
+    "bóng": ["bóng bẩy"],
+    "bộ": ["bộ ba", "bộ binh"],
+    "chơi": ["chơi trò", "chơi vơi"],
+    "cá": ["cá bể"],
+    "cây": ["cây cọ", "cây cỏ"],
+    "cơm": ["cơm nước"],
+    "cửa": ["cửa khẩu"],
+    "game": ["game cổ"],
+    "hình": ["hình học", "hình như"],
+    "lịm": ["lịm đi"],
+    "lố": ["lố bịch", "lố lăng"],
+    "màu": ["màu vẽ"],
+    "ngủ": ["ngủ nghỉ"],
+    "nhà": ["nhà sang"],
+    "nhóm": ["nhóm nhạc"],
+    "nhạc": ["nhạc cổ", "nhạc pop"],
+    "phim": ["phim rạp", "phim truyện"],
+    "rau": ["rau cỏ"],
+    "sách": ["sách truyện"],
+    "sáng": ["sáng suốt"],
+    "thể": ["thể dục"],
+    "tim": ["tim đỏ"],
+    "tranh": ["tranh dán", "tranh truyện"],
+    "tên": ["tên gọi"],
+    "tập": ["tập thể", "tập tễnh"],
+    "việc": ["việc vặt"],
+    "ăn": ["ăn nói"],
+    "đường": ["đường đi"],
+    "đồ": ["đồ dùng"],
+    "dội": ["dội bom", "dội nước"],
+    "gỗ": ["gỗ mun"],
+    "hàng": ["hàng họ"],
+    "điền": ["điền từ", "điền ô"],
+}
+for _k, _phrases in EXTRA_RESPONSES_8.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}

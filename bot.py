@@ -138,6 +138,11 @@ WORD_GAME_ALWAYS_INVALID = {
     "ngợm nghĩnh", "ngợm nghệch", "nhở việc", "nhở vuệc", "nàn nỉ",
     "này thì", "queo queo", "queo ruốc", "sủa nhặng", "đán từ",
     "xề la", "xề là", "xề và", "xề xề",
+    # Cụm rác/typo/filler từ đợt test 2026-07-07.
+    "cộn sóng", "cộn tin", "dã dang", "dã thua", "gỏng gáy", "gỏng gông",
+    "lè lè", "mà bạn", "mà ma", "mà này", "nay kia", "nay này", "nay nọ",
+    "ngạt ngào", "nhẹt nhẹt", "phào phèo", "phào pháo", "báo daid",
+    "đồ đung", "game gủng", "con r",
 }
 # Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
 WORD_GAME_BOT_AVOID_PHRASES = {
@@ -1420,7 +1425,12 @@ def _parse_word_game_verdict(text):
 
 async def judge_word_game_phrase(phrase, source="không rõ"):
     """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau."""
+    ensure_word_game_dictionary()
     canonical = canonical_word_game_text(phrase)
+    # Cụm đã nằm trong từ điển tĩnh thì đương nhiên hợp lệ, khỏi hỏi AI (tránh 'chưa rõ' oan).
+    if canonical in word_game_dictionary_phrases:
+        word_game_validity_cache[canonical] = True
+        return True
     if canonical in word_game_validity_cache:
         valid = word_game_validity_cache[canonical]
         record_unknown_word_phrase(canonical, source, valid)
