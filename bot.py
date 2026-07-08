@@ -2589,13 +2589,20 @@ def _strip_speaker_label(text):
     return re.sub(r"^\s*(?:(?:zun\w*|mrzunniderrs)\s*[:：]\s*)+", "", text or "", flags=re.IGNORECASE)
 
 
-# Model đôi khi phun suy nghĩ/meta thay vì câu trả lời. Chặn hẳn.
+# Model đôi khi phun suy nghĩ/meta thay vì câu trả lời. Chặn hẳn (số ít/nhiều, Anh/Việt).
 _META_LEAD_RE = re.compile(
-    r"^\s*(?:\**\s*(?:thought|suy nghĩ|phân tích|reasoning|note|meta)\s*\**\s*[:：])",
+    r"^\s*[\*\#\-\s]*"
+    r"(?:thoughts?|thinking|reasoning|analysis|internal|reflection|note|meta|plan"
+    r"|suy nghĩ|phân tích|nhận định|đánh giá)"
+    r"\b[^:：\n]{0,30}[:：]",
     re.IGNORECASE,
 )
+# Kể chuyện ngôi thứ 3 về chính Zun/User thay vì đóng vai (Anh + Việt).
 _META_NARRATE_RE = re.compile(
-    r"^\s*(?:user\b|người dùng\b|nấm\b|zun\b).{0,60}?\b(?:đang|vừa|nên|đã|muốn|tag|gửi|nói)\b",
+    r"^\s*(?:the\s+user\b|user\b|người dùng\b|nấm\b|zun[''`]?s?\b|nam\b)"
+    r".{0,80}?"
+    r"\b(?:is|are|was|were|has|have|should|would|will|wants?|asking|trying"
+    r"|đang|vừa|nên|đã|muốn|tag|gửi|nói|persona|phản ứng)\b",
     re.IGNORECASE,
 )
 
@@ -2607,6 +2614,9 @@ def looks_like_meta(text):
         return False
     if _META_LEAD_RE.match(t):
         return True
+    # Nhắc tới "persona" gần như luôn là meta phân tích, không phải lời chat.
+    if re.search(r"\bpersona\b", t, re.IGNORECASE):
+        return True
     # Câu kể chuyện ngôi thứ 3 về chính Zun/User (dài dòng phân tích).
     return bool(_META_NARRATE_RE.match(t) and len(t) > 40)
 
@@ -2617,10 +2627,14 @@ def strip_meta_reasoning(text):
     if not t:
         return t
     if _META_LEAD_RE.match(t):
-        # Bỏ từ nhãn tới hết đoạn đầu (đến dòng trống hoặc hết chuỗi).
+        # Ưu tiên tách theo dòng trống; không có thì thử tách theo nhãn lời thật (REPLY/ANSWER/Zun nói).
         after = re.split(r"\n\s*\n", t, maxsplit=1)
-        t = after[1].strip() if len(after) > 1 else ""
-    return t
+        if len(after) > 1:
+            t = after[1].strip()
+        else:
+            reply = re.split(r"(?i)\b(?:reply|answer|response|final|zun (?:nói|đáp)|câu trả lời)\s*[:：]", t, maxsplit=1)
+            t = reply[1].strip() if len(reply) > 1 else ""
+    return _strip_speaker_label(t).strip()
 
 
 def clean_answer(text):
