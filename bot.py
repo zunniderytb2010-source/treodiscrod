@@ -2589,6 +2589,40 @@ def _strip_speaker_label(text):
     return re.sub(r"^\s*(?:(?:zun\w*|mrzunniderrs)\s*[:：]\s*)+", "", text or "", flags=re.IGNORECASE)
 
 
+# Model đôi khi phun suy nghĩ/meta thay vì câu trả lời. Chặn hẳn.
+_META_LEAD_RE = re.compile(
+    r"^\s*(?:\**\s*(?:thought|suy nghĩ|phân tích|reasoning|note|meta)\s*\**\s*[:：])",
+    re.IGNORECASE,
+)
+_META_NARRATE_RE = re.compile(
+    r"^\s*(?:user\b|người dùng\b|nấm\b|zun\b).{0,60}?\b(?:đang|vừa|nên|đã|muốn|tag|gửi|nói)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_meta(text):
+    """Câu trả lời có phải là suy nghĩ/kể chuyện (không phải lời Zun chat) không."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _META_LEAD_RE.match(t):
+        return True
+    # Câu kể chuyện ngôi thứ 3 về chính Zun/User (dài dòng phân tích).
+    return bool(_META_NARRATE_RE.match(t) and len(t) > 40)
+
+
+def strip_meta_reasoning(text):
+    """Cắt khối THOUGHT/phân tích ở đầu; trả phần lời chat thật nếu model có kèm sau đó."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    if _META_LEAD_RE.match(t):
+        # Bỏ từ nhãn tới hết đoạn đầu (đến dòng trống hoặc hết chuỗi).
+        after = re.split(r"\n\s*\n", t, maxsplit=1)
+        t = after[1].strip() if len(after) > 1 else ""
+    return t
+
+
 def clean_answer(text):
     """Bỏ dấu ngoặc kép model tự thêm bọc câu trả lời (lỗi kiểu: xin chào.")"""
     text = sanitize_ai_output(text).strip()
@@ -2819,7 +2853,10 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         "Không tự chuyển chủ đề. Không dùng câu greeting khi user đã nói nội dung. "
         "Không lặp lại nguyên văn hoặc gần giống câu Zun đã nói trong tin nhắn gần đây, đổi cả cách mở đầu. "
         "Viết thường như đang nhắn tin, giọng tự nhiên đúng persona. "
-        "CHỈ viết đúng nội dung câu trả lời, TUYỆT ĐỐI không thêm tiền tố 'zun:' hay tên người nào trước câu."
+        "CHỈ viết đúng nội dung câu trả lời, TUYỆT ĐỐI không thêm tiền tố 'zun:' hay tên người nào trước câu. "
+        "M LÀ Zun đang chat ở ngôi thứ nhất, KHÔNG phải người kể chuyện. Cấm tuyệt đối viết phân tích, "
+        "suy nghĩ, meta, hay mô tả tình huống kiểu 'THOUGHT:', 'User ... đang', 'Zun nên/Zun đã ...'. "
+        "Chỉ xuất ra đúng 1 câu chat mà Zun gửi thẳng, không giải thích vì sao."
     )
     if help_mode:
         chat_rule += (
@@ -2889,6 +2926,25 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         ]
         answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET)
 
+    # Model phun THOUGHT/phân tích thay vì lời chat: cắt meta, nếu vẫn hỏng thì hỏi lại 1 lần cực gắt.
+    if not code_mode:
+        cleaned = strip_meta_reasoning(answer)
+        if not cleaned or looks_like_meta(cleaned):
+            retry_messages = messages + [
+                {"role": "assistant", "content": answer},
+                {"role": "user", "content": (
+                    "Vừa rồi m viết suy nghĩ/phân tích chứ không phải lời chat. Viết LẠI đúng 1 câu chat "
+                    "ngắn mà Zun gửi thẳng, ngôi thứ nhất, không 'THOUGHT', không phân tích, không mô tả."
+                )},
+            ]
+            try:
+                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0)
+                retry = strip_meta_reasoning(retry)
+                cleaned = retry if (retry and not looks_like_meta(retry)) else ""
+            except Exception:
+                cleaned = ""
+        answer = cleaned or random.choice(["gì v", "sao", "hử", "nói lẹ", "j đó"])
+
     answer = ensure_code_fenced(answer, prompt) if code_mode else answer
     answer = style_clean_answer(
         answer,
@@ -2917,7 +2973,7 @@ async def make_roast(gid, target_name, channel_id=None):
     context = build_channel_context(channel_id) if channel_id else ""
     task = (
         f"viết ĐÚNG 1 câu roast {target_name}, TỐI ĐA 20 từ, có twist bất ngờ ở cuối, đọc phát cười phát.\n"
-        "- Trong lúc suy nghĩ hãy nghĩ ra 3-4 hướng roast khác nhau rồi CHỌN câu đau và gọn nhất mới trả lời.\n"
+        "- CHỈ xuất đúng 1 câu roast cuối cùng. Cấm viết suy nghĩ, phân tích, liệt kê hướng, 'THOUGHT', hay giải thích.\n"
         "- Cấm viết dài vòng vo, cấm nối 'mà... vẫn...' lê thê, cấm giải thích joke. Punchline phải nằm cuối câu.\n"
         "- Cấm mở đầu bằng tên nó kiểu 'X đấy chứ ai', cấm 'thằng này', 'kiểu người'. Vào thẳng câu chọc.\n"
         "- Có [Tin nhắn gần đây trong kênh] thì bám vào đúng cái nó vừa nói/cách nó gõ mà chọc, càng cá nhân càng đau.\n"
@@ -2931,10 +2987,12 @@ async def make_roast(gid, target_name, channel_id=None):
         "Chỉ trả về đúng câu roast."
     )
     user_content = f"{context}\n\nRoast {target_name} đi" if context else f"Roast {target_name} đi"
-    return await ai_task(
+    roast = await ai_task(
         gid, task, user_content,
-        max_tokens=300, thinking_budget=2048, model=ROAST_MODEL,
+        max_tokens=300, thinking_budget=0, model=ROAST_MODEL,
     )
+    roast = strip_meta_reasoning(roast)
+    return roast if roast and not looks_like_meta(roast) else "lag tí, khịa lại sau"
 
 
 def extract_prompt(message):
