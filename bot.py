@@ -145,6 +145,8 @@ WORD_GAME_ALWAYS_INVALID = {
     "đồ đung", "game gủng", "con r",
     # Cụm lặp từ khác thanh, nối vẹt (cũng bị is_tone_reduplication chặn).
     "quèo queo", "queo quèo", "xoe xòe", "xòe xoe", "chăng chối",
+    # Cụm bịa để lách bẫy (2026-07-09).
+    "tợn của", "tợn tệ", "tợn ghê",
 }
 # Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
 WORD_GAME_BOT_AVOID_PHRASES = {
@@ -153,9 +155,10 @@ WORD_GAME_BOT_AVOID_PHRASES = {
 # Từ đuôi gần như không có đường nối chuẩn: nước gài chết, bot ƯU TIÊN ra để ép thua.
 WORD_GAME_KILL_WORDS = {
     "ngoằng", "lự",
-    # Từ tượng thanh / hiếm, người chơi gần như không nối tiếp được (bot phải RA được).
-    "khè", "rụm", "quèo", "quắp", "oạch", "rẹt", "xoẹt", "choẹt", "bùm",
-    "hoắc", "khét", "tịt", "xịt", "biếc", "nần", "đơ", "quắt", "rít", "toác",
+    # Từ TUYỆT ĐƯỜNG NỐI thật sự (không có cụm nào bắt đầu bằng nó). Đã loại các từ
+    # tưởng cụt mà thực ra nối được (khét lẹt, xịt keo, đơ máy, rít lên, quắp đuôi...).
+    "khè", "rụm", "quèo", "oạch", "rẹt", "xoẹt", "choẹt", "bùm",
+    "hoắc", "biếc", "nần", "toác", "tợn",
 }
 # Cụm chứa từ tục/nhạy cảm không được tính lượt, cả phía người chơi lẫn bot.
 WORD_GAME_BANNED_WORDS = {
@@ -1514,7 +1517,7 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
     except Exception as exc:
         log.warning("AI kiểm nghĩa nối từ lỗi (%s)", type(exc).__name__)
         record_unknown_word_phrase(canonical, source)
-        return None
+        return False  # AI hỏng/hết key: không xác nhận được -> xử strike, không cho qua bừa
     parsed = _parse_word_game_verdict(verdict)
     if parsed is True:
         valid = True
@@ -1540,15 +1543,15 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
             recheck = await _claude(recheck_messages, max_tokens=8, temperature=0, thinking_budget=0)
         except Exception:
             record_unknown_word_phrase(canonical, source)
-            return None
+            return False
         rechecked = _parse_word_game_verdict(recheck)
         if rechecked is None:
             record_unknown_word_phrase(canonical, source)
-            return None
+            return False
         valid = rechecked
     else:
         record_unknown_word_phrase(canonical, source)
-        return None
+        return False
     word_game_validity_cache[canonical] = valid
     record_unknown_word_phrase(canonical, source, valid)
     return valid

@@ -12634,3 +12634,9 @@ for _k, _phrases in BIG_COVERAGE.items():
         if _p not in _bucket:
             _bucket.append(_p)
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Xoa rac cho lach bay kill word (2026-07-09).
+for _junk in ["tợn ghê", "tợn tệ"]:
+    for _k in list(RESPONSE_MAP):
+        RESPONSE_MAP[_k] = [_p for _p in RESPONSE_MAP[_k] if _p != _junk]
+RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
