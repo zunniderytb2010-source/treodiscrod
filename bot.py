@@ -143,6 +143,8 @@ WORD_GAME_ALWAYS_INVALID = {
     "lè lè", "mà bạn", "mà ma", "mà này", "nay kia", "nay này", "nay nọ",
     "ngạt ngào", "nhẹt nhẹt", "phào phèo", "phào pháo", "báo daid",
     "đồ đung", "game gủng", "con r",
+    # Cụm lặp từ khác thanh, nối vẹt (cũng bị is_tone_reduplication chặn).
+    "quèo queo", "queo quèo", "xoe xòe", "xòe xoe", "chăng chối",
 }
 # Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
 WORD_GAME_BOT_AVOID_PHRASES = {
@@ -1341,6 +1343,14 @@ def reverses_used_phrase(phrase, used_phrases):
     return len(words) == 2 and f"{words[1]} {words[0]}" in used_phrases
 
 
+def is_tone_reduplication(phrase):
+    """2 từ cùng gốc chỉ khác thanh điệu/hoàn toàn giống (quèo queo, xoe xòe, queo queo)."""
+    words = canonical_word_game_text(phrase).split()
+    if len(words) != 2:
+        return False
+    return normalize_word_game_text(words[0]) == normalize_word_game_text(words[1])
+
+
 def _player_continuation_count(word, used_phrases, cap=10):
     """Đếm sơ bộ số cụm NGƯỜI CHƠI còn nối được từ 'word' trong từ điển; càng ít họ càng dễ bí."""
     count = 0
@@ -1474,6 +1484,12 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         record_unknown_word_phrase(canonical, source, True)
         return True
     if canonical in {canonical_word_game_text(item) for item in WORD_GAME_ALWAYS_INVALID}:
+        word_game_validity_cache[canonical] = False
+        record_unknown_word_phrase(canonical, source, False)
+        return False
+    # Cụm lặp từ chỉ khác thanh điệu (quèo queo, xoe xòe) là nối vẹt, không hợp lệ.
+    # Cụm lặp có nghĩa thật (nhè nhẹ, đo đỏ...) đã nằm trong từ điển nên qua ở trên rồi.
+    if is_tone_reduplication(canonical):
         word_game_validity_cache[canonical] = False
         record_unknown_word_phrase(canonical, source, False)
         return False

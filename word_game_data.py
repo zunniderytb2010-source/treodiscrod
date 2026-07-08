@@ -12380,3 +12380,80 @@ for _k, _phrases in EXTRA_RESPONSES_9.items():
         if _p not in _bucket:
             _bucket.append(_p)
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Va bot thua tu de + tu hop le tu ban xuat (2026-07-07 batch 8).
+EXTRA_RESPONSES_10 = {
+    "cư": ["cư trú", "cư dân", "cư xử", "cư ngụ"],
+    "bi": ["bi tròn", "bi kịch", "bi ai", "bi thương"],
+    "cãi": ["cãi vã", "cãi cọ", "cãi nhau"],
+    "hình": ["hình thức"],
+    "lưỡng": ["lưỡng cư"],
+    "mờ": ["mờ tịt"],
+    "ngòi": ["ngòi bút", "ngòi nổ"],
+    "quẹo": ["quẹo phải", "quẹo trái", "quẹo lựa"],
+    "tỉnh": ["tỉnh táo", "tỉnh giấc", "tỉnh ngộ", "tỉnh bơ"],
+    "trú": ["trú ẩn", "trú mưa", "trú ngụ"],
+    "ngụ": ["ngụ ngôn", "ngụ ý"],
+    "táo": ["táo bạo", "táo tợn", "táo quân"],
+    "thức": ["thức ăn", "thức khuya", "thức tỉnh", "thức thời"],
+    "vã": ["vã mồ hôi"],
+    "bút": ["bút bi", "bút chì", "bút máy", "bút danh"],
+    "cọ": ["cọ xát", "cọ rửa"],
+    "phải": ["phải trái", "phải chăng"],
+}
+for _k, _phrases in EXTRA_RESPONSES_10.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Tu lay giam nghia hop le (de khong bi is_tone_reduplication chan oan).
+VALID_REDUP = {
+    "đo": ["đo đỏ"], "tim": ["tim tím"], "xanh": ["xanh xanh"],
+    "đen": ["đen đen"], "nho": ["nho nhỏ"], "con": ["con con"],
+    "xa": ["xa xa"], "cao": ["cao cao"], "dài": ["dài dài"],
+    "vàng": ["vàng vàng"], "hồng": ["hồng hồng"], "khe": ["khe khẽ"],
+    "cay": ["cay cay"], "chua": ["chua chua"], "tròn": ["tròn trịa"],
+    "be": ["be bé"], "trăng": ["trăng trắng"], "nâu": ["nâu nâu"],
+}
+for _k, _phrases in VALID_REDUP.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Va hang loat cho bot bi ket (2026-07-07 batch 9).
+EXTRA_RESPONSES_11 = {
+    "dùng": ["dùng dằng"], "địa": ["địa chỉ", "địa điểm", "địa ngục", "địa đạo"],
+    "kiểm": ["kiểm tra", "kiểm soát", "kiểm điểm"], "như": ["như ý", "như nhau"],
+    "thai": ["thai nghén", "thai nhi"], "phấn": ["phấn đấu", "phấn khởi", "phấn son"],
+    "hoạch": ["hoạch định"], "ơn": ["ơn nghĩa", "ơn huệ"],
+    "tiến": ["tiến bộ", "tiến hóa", "tiến công", "tiến lên"], "trúc": ["trúc trắc"],
+    "kém": ["kém cỏi", "kém cạnh"], "nơi": ["nơi chốn", "nơi ở"],
+    "ngăn": ["ngăn cản", "ngăn nắp", "ngăn chặn"], "phúc": ["phúc lợi", "phúc hậu", "phúc đức"],
+    "nhìn": ["nhìn nhận", "nhìn ngắm"], "lông": ["lông mày", "lông lá", "lông vũ"],
+    "chài": ["chài lưới"], "ngây": ["ngây thơ", "ngây ngô", "ngây dại"],
+    "lưỡi": ["lưỡi liềm", "lưỡi hái", "lưỡi dao"], "cua": ["cua bể", "cua đồng", "cua gái"],
+    "ốc": ["ốc sên", "ốc bươu", "ốc vít"], "hấp": ["hấp dẫn", "hấp thụ", "hấp tấp"],
+    "lam": ["lam lũ", "lam nham"], "ván": ["ván cờ", "ván bài", "ván gỗ"],
+    "chọi": ["chọi gà", "chọi trâu"], "mái": ["mái nhà", "mái tóc", "mái chèo", "mái ấm"],
+    "đấm": ["đấm bốc", "đấm đá"], "khám": ["khám phá", "khám bệnh", "khám xét"],
+    "hạ": ["hạ cánh", "hạ gục", "hạ giá", "hạ màn"], "phạm": ["phạm tội", "phạm luật", "phạm vi", "phạm nhân"],
+    "nghiên": ["nghiên cứu", "nghiên mực"], "vơi": ["vơi bớt", "vơi đi"],
+    "đoạn": ["đoạn văn", "đoạn đường", "đoạn tuyệt"], "khăn": ["khăn tay", "khăn quàng", "khăn giấy"],
+    "rút": ["rút lui", "rút gọn", "rút tiền"], "chưng": ["chưng cất", "chưng bày", "chưng diện"],
+    "đa": ["đa số", "đa dạng", "đa tình", "đa nghi"], "giò": ["giò chả", "giò lụa"],
+    "nêm": ["nêm nếm"], "kề": ["kề vai", "kề cận"], "lau": ["lau chùi", "lau nhà", "lau sậy"],
+    "no": ["no nê", "no đủ"], "sắn": ["sắn dây", "sắn luộc"], "nhậu": ["nhậu nhẹt"],
+    "dù": ["dù sao", "dù cho"], "đả": ["đả kích", "đả thông", "đả đảo"],
+    "chắn": ["chắn bùn"], "lúc": ["lúc lắc"], "nải": ["nải chuối"],
+    "chỏm": ["chỏm tóc"], "hoét": ["hoét mắt"], "phết": ["phết phẩy"],
+}
+for _k, _phrases in EXTRA_RESPONSES_11.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
