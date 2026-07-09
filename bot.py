@@ -83,6 +83,7 @@ UNKNOWN_BACKUP_FILENAME = "unknown_words_backup.json"
 # Update/redeploy: báo bảo trì, hoàn tiền cược ván dở, chờ instance cũ backup xong mới khôi phục.
 WORD_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "word_game_sessions.json")
 SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
+LEARNED_BACKUP_FILENAME = "learned_words_backup.json"
 MAINTENANCE_RESTORE_DELAY_SECONDS = 20
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
@@ -694,6 +695,10 @@ def _build_backup_files():
             io.BytesIO(json.dumps(_serialize_word_game_sessions(), ensure_ascii=False, indent=2).encode("utf-8")),
             filename=SESSIONS_BACKUP_FILENAME,
         ),
+        discord.File(
+            io.BytesIO(json.dumps(learned_words, ensure_ascii=False).encode("utf-8")),
+            filename=LEARNED_BACKUP_FILENAME,
+        ),
     ]
 
 
@@ -749,7 +754,8 @@ async def restore_game_backup_from_dm():
     need_unknown = not unknown_word_phrases
     local_sessions = _load_local_session_data()
     need_sessions = not (local_sessions.get("sessions") or local_sessions.get("refunds"))
-    if not need_profiles and not need_unknown and not need_sessions:
+    need_learned = not os.path.exists(LEARNED_WORDS_FILE)
+    if not need_profiles and not need_unknown and not need_sessions and not need_learned:
         return
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
@@ -797,6 +803,19 @@ async def restore_game_backup_from_dm():
                         log.info("Đã khôi phục %s ván nối từ từ backup DM", len(raw))
                     except OSError as exc:
                         log.warning("Không ghi được file ván nối từ: %s", exc)
+            elif need_learned and attachment.filename == LEARNED_BACKUP_FILENAME:
+                try:
+                    raw = json.loads((await attachment.read()).decode("utf-8"))
+                except (json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup từ đã học trong DM lỗi: %s", exc)
+                    continue
+                if isinstance(raw, dict) and raw:
+                    try:
+                        with open(LEARNED_WORDS_FILE, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, ensure_ascii=False)
+                        log.info("Đã khôi phục %s từ đã học từ backup DM", len(raw))
+                    except OSError as exc:
+                        log.warning("Không ghi được file từ đã học: %s", exc)
     except discord.HTTPException as exc:
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
 
@@ -1314,10 +1333,108 @@ def parse_word_game_bet(text):
     return int(value) if value > 0 and value == int(value) else None
 
 
+VN_DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vietnamese_words.json")
+LEARNED_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learned_words.json")
+_external_dict_loaded = False
+
+
+def _merge_external_dict(path, source_label):
+    """Nạp từ điển ngoài dạng {từ_đầu: [từ_sau,...]} và merge vào RESPONSE_MAP, lọc rác."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    invalid = {canonical_word_game_text(item) for item in WORD_GAME_ALWAYS_INVALID}
+    added = 0
+    for key, seconds in data.items():
+        if not isinstance(seconds, list) or not isinstance(key, str):
+            continue
+        key = key.lower().strip()
+        if not key or word_is_foreign(key) or key in WORD_GAME_BANNED_WORDS:
+            continue
+        bucket = RESPONSE_MAP.setdefault(key, [])
+        existing = set(bucket)
+        for second in seconds:
+            if not isinstance(second, str):
+                continue
+            second = second.lower().strip()
+            phrase = f"{key} {second}"
+            if (
+                not second or phrase in existing or key == second
+                or word_is_foreign(second) or second in WORD_GAME_BANNED_WORDS
+                or phrase in invalid
+            ):
+                continue
+            bucket.append(phrase)
+            existing.add(phrase)
+            added += 1
+    if added:
+        log.info("Đã nạp %s cụm từ %s", added, source_label)
+    return added
+
+
+learned_words = {}  # {từ_đầu: [từ_sau,...]} bot tự học từ AI, lưu bền qua file + backup
+
+
+def load_external_dictionaries():
+    global _external_dict_loaded, learned_words
+    if _external_dict_loaded:
+        return
+    _external_dict_loaded = True
+    _merge_external_dict(VN_DICT_FILE, "từ điển tiếng Việt")
+    _merge_external_dict(LEARNED_WORDS_FILE, "từ đã học")
+    try:
+        with open(LEARNED_WORDS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            learned_words = {k: list(v) for k, v in data.items() if isinstance(v, list)}
+    except (OSError, json.JSONDecodeError):
+        learned_words = {}
+
+
+def save_learned_words():
+    global _game_backup_dirty
+    try:
+        temp = LEARNED_WORDS_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(learned_words, handle, ensure_ascii=False)
+        os.replace(temp, LEARNED_WORDS_FILE)
+        _game_backup_dirty = True  # để backup DM đẩy lên, sống qua redeploy Render
+    except OSError as exc:
+        log.warning("Không lưu được learned_words: %s", exc)
+
+
+def learn_word_phrase(canonical):
+    """AI vừa xác nhận cụm này hợp lệ: nhớ vĩnh viễn để lần sau khỏi hỏi AI."""
+    words = canonical.split()
+    if len(words) != 2 or words[0] == words[1]:
+        return
+    key, second = words
+    if word_is_foreign(key) or word_is_foreign(second):
+        return
+    bucket = learned_words.setdefault(key, [])
+    if second in bucket:
+        return
+    bucket.append(second)
+    # Dùng được ngay trong ván hiện tại.
+    RESPONSE_MAP.setdefault(key, [])
+    if canonical not in RESPONSE_MAP[key]:
+        RESPONSE_MAP[key].append(canonical)
+    if word_game_response_map is not None:
+        word_game_response_map.setdefault(key, []).append(canonical)
+    if word_game_dictionary_phrases is not None:
+        word_game_dictionary_phrases.add(canonical)
+    save_learned_words()
+
+
 def ensure_word_game_dictionary():
     global word_game_response_map, word_game_dead_ends, word_game_start_pool, word_game_dictionary_phrases
     if word_game_response_map is not None:
         return
+    load_external_dictionaries()
     normalized_map = defaultdict(list)
     for key, phrases in RESPONSE_MAP.items():
         normalized_key = canonical_word_game_text(key)
@@ -1595,6 +1712,8 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
         return True
     word_game_validity_cache[canonical] = valid
     record_unknown_word_phrase(canonical, source, valid)
+    if valid:
+        learn_word_phrase(canonical)  # AI xác nhận VALID -> bot tự học vào từ điển
     return valid
 
 
@@ -4038,5 +4157,6 @@ if not GEMINI_KEYS:
 log.info("AI: Gemini model %s, %s key trong xoay vòng", GEMINI_MODEL, len(GEMINI_KEYS))
 load_game_data()
 load_unknown_word_phrases()
+# Từ điển lớn + từ đã học nạp lazy ở ván đầu (sau khi on_ready khôi phục learned từ DM).
 start_keepalive_server()
 bot.run(DISCORD_TOKEN)

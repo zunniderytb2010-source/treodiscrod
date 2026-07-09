@@ -5,3 +5,7 @@ game_data.json
 game_data.json.tmp
 unknown_word_phrases.json
 unknown_word_phrases.json.tmp
+word_game_sessions.json
+word_game_sessions.json.tmp
+learned_words.json
+learned_words.json.tmp
