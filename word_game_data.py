@@ -12675,3 +12675,23 @@ for _src in (_KILL_VALID, _FIX):
             if _p not in _bucket:
                 _bucket.append(_p)
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# Tu HOP LE tu ban xuat (2026-07-09 batch 11).
+EXTRA_RESPONSES_12 = {
+    "cải": ["cải cách"], "dội": ["dội lại"], "ngục": ["ngục tù", "ngục thất"],
+    "quắt": ["quắt lại"], "tiền": ["tiền tiêu"], "đầu": ["đầu têu", "đầu não"],
+    "chuyện": ["chuyện xưa"], "cổ": ["cổ họng"], "dùng": ["dùng thử"], "dở": ["dở ẹc"],
+    "giận": ["giận dữ"], "ho": ["ho khan", "ho hen"], "hoàng": ["hoàng gia"],
+    "hàng": ["hàng trăm"], "học": ["học bổng"], "hỏng": ["hỏng bét"], "lớp": ["lớp phó"],
+    "méo": ["méo xệch"], "mồm": ["mồm miệng"], "nhạc": ["nhạc chuông"],
+    "quật": ["quật cường", "quật khởi"], "rửa": ["rửa sạch", "rửa tội", "rửa mặt"],
+    "thể": ["thể tích"], "thở": ["thở ra", "thở dài", "thở phào"], "tranh": ["tranh thêu"],
+    "trận": ["trận địa"], "tịt": ["tịt ngóm"], "xiết": ["xiết chặt", "xiết nợ"],
+    "xài": ["xài hoang", "xài sang"],
+}
+for _k, _phrases in EXTRA_RESPONSES_12.items():
+    _bucket = RESPONSE_MAP.setdefault(_k, [])
+    for _p in _phrases:
+        if _p not in _bucket:
+            _bucket.append(_p)
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}

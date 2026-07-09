@@ -146,7 +146,13 @@ WORD_GAME_ALWAYS_INVALID = {
     # Cụm lặp từ khác thanh, nối vẹt (cũng bị is_tone_reduplication chặn).
     "quèo queo", "queo quèo", "xoe xòe", "xòe xoe", "chăng chối",
     # Cụm bịa để lách bẫy (2026-07-09).
-    "tợn của", "tợn tệ", "tợn ghê",
+    "tợn của", "tợn tệ", "tợn ghê", "tợn cướp", "tợn kìa",
+    # Bảng cụm rác từ ban xuat 2026-07-09: vocative/tiếng Anh/ghép vô nghĩa.
+    "chẽ giữa", "cong méo", "cưng ơi", "duo collection", "gũi tre",
+    "highpoly của", "hòe nhai", "kìa bạn", "lét vẽ", "mó to", "mẫn nhi",
+    "mẻ nhúng", "nhé bạn", "nữa mà", "offline game", "offline luôn",
+    "ren cửa", "thãi ra", "tiện mồn", "tắn kìa", "xóm nhái", "chơi nhau",
+    "chết cụ", "xịn đét", "nhè cơm",
 }
 # Cụm nghe gượng: người chơi nói thì tha, nhưng bot không được tự ra.
 WORD_GAME_BOT_AVOID_PHRASES = {
