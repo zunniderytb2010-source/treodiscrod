@@ -12695,3 +12695,39 @@ for _k, _phrases in EXTRA_RESPONSES_12.items():
         if _p not in _bucket:
             _bucket.append(_p)
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _w not in RESPONSE_MAP or RESPONSE_MAP[_w]}
+
+# ==================== BO TIENG ANH (2026-07-09) ====================
+import unicodedata as _ud
+def _strip_tone(_x):
+    _x = (_x or "").replace("đ", "d")
+    _x = _ud.normalize("NFD", _x)
+    return "".join(_c for _c in _x if _ud.category(_c) != "Mn")
+_ENGLISH_WORDS = {
+    "acc","ads","anti","api","app","bait","bake","beta","blender","boss","buff",
+    "bug","camera","caption","clip","cloud","code","cola","collection","combat","combo",
+    "cpu","crash","css","dame","data","demo","discord","driver","drop","duo","export",
+    "game","gpu","grind","gui","heal","highpoly","host","hot","html","import","jpg",
+    "js","key","kick","kill","lag","laptop","layout","leave","led","level","like",
+    "link","lite","loot","lowpoly","lua","manual","map","max","meme","meta","min",
+    "mob","mocap","mod","model","monster","mp3","mp4","mute","net","noob","npc",
+    "online","pack","patch","pc","pdf","pepsi","photo","ping","plus","png","pop",
+    "private","pro","public","python","pve","pvp","ram","real","realistic","render",
+    "reset","rig","roblox","script","server","shader","silent","skill","skin","soda",
+    "spam","stable","sting","stream","studio","sub","tab","team","tele","test","texture",
+    "timeout","tivi","trend","troll","tryhard","usb","video","vietsub","vip","vpn","wr","gg","sql","gif",
+}
+def _is_foreign(_w):
+    _w = _w.lower()
+    if _w in _ENGLISH_WORDS:
+        return True
+    return any(_c in _strip_tone(_w) for _c in "fjwz")
+def _phrase_has_foreign(_p):
+    return any(_is_foreign(_x) for _x in _p.split())
+for _k in list(RESPONSE_MAP):
+    if _is_foreign(_k):
+        del RESPONSE_MAP[_k]
+        continue
+    RESPONSE_MAP[_k] = [_p for _p in RESPONSE_MAP[_k] if not _phrase_has_foreign(_p)]
+RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if not _is_foreign(_w)}
+START_PHRASES = [_p for _p in START_PHRASES if not _phrase_has_foreign(_p)]
