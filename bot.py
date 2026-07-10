@@ -189,6 +189,11 @@ WORD_GAME_BANNED_WORDS = {
     "lồn", "loz", "cặc", "cak", "buồi", "đụ", "địt", "đéo", "đĩ", "điếm",
     "cứt", "cức", "sex", "porn",
 }
+# Từ TV bình thường nhưng chủ bot cấm chơi trong game (dễ bị lách/ép bí): cả bot lẫn
+# người chơi đều KHÔNG được ghép cụm nào chứa từ này; từ điển cũng bị lọc bỏ hết.
+WORD_GAME_FORBIDDEN_WORDS = {
+    "rồi",
+}
 # Nối từ CHỈ tiếng Việt: từ tiếng Anh không tính (f/j/w/z không có trong tiếng Việt +
 # danh sách English hay gặp). "ban" là tiếng Việt (ban ngày, ban nhạc) nên KHÔNG nằm đây.
 WORD_GAME_ENGLISH_WORDS = {
@@ -1431,7 +1436,7 @@ def _merge_external_dict(path, source_label, mark_external=True):
         if not isinstance(seconds, list) or not isinstance(key, str):
             continue
         key = key.lower().strip()
-        if not key or word_is_foreign(key) or key in WORD_GAME_BANNED_WORDS:
+        if not key or word_is_foreign(key) or key in WORD_GAME_BANNED_WORDS or key in WORD_GAME_FORBIDDEN_WORDS:
             continue
         bucket = RESPONSE_MAP.setdefault(key, [])
         existing = set(bucket)
@@ -1443,6 +1448,7 @@ def _merge_external_dict(path, source_label, mark_external=True):
             if (
                 not second or phrase in existing or key == second
                 or word_is_foreign(second) or second in WORD_GAME_BANNED_WORDS
+                or second in WORD_GAME_FORBIDDEN_WORDS
                 or phrase in invalid
             ):
                 continue
@@ -1704,6 +1710,8 @@ def learn_word_phrase(canonical):
     key, second = words
     if word_is_foreign(key) or word_is_foreign(second):
         return
+    if key in WORD_GAME_FORBIDDEN_WORDS or second in WORD_GAME_FORBIDDEN_WORDS:
+        return  # không học lại từ đã cấm chơi
     bucket = learned_words.setdefault(key, [])
     if second in bucket:
         return
@@ -1727,18 +1735,22 @@ def ensure_word_game_dictionary():
     normalized_map = defaultdict(list)
     for key, phrases in RESPONSE_MAP.items():
         normalized_key = canonical_word_game_text(key)
+        if normalized_key in WORD_GAME_FORBIDDEN_WORDS:
+            continue  # bỏ hẳn từ cấm khỏi nguồn nước đi của bot
         for phrase in phrases:
-            if len(canonical_word_game_text(phrase).split()) == 2:
+            if len(canonical_word_game_text(phrase).split()) == 2 and not phrase_has_forbidden(phrase):
                 normalized_map[normalized_key].append(phrase)
     word_game_response_map = dict(normalized_map)
     word_game_dictionary_phrases = {
         canonical_word_game_text(phrase)
         for phrase in START_PHRASES
+        if not phrase_has_forbidden(phrase)
     }
     word_game_dictionary_phrases.update(
         canonical_word_game_text(phrase)
         for phrases in RESPONSE_MAP.values()
         for phrase in phrases
+        if not phrase_has_forbidden(phrase)
     )
     word_game_dead_ends = {canonical_word_game_text(word) for word in DEAD_END_WORDS}
     word_game_start_pool = []
@@ -1765,6 +1777,14 @@ def choose_word_game_start():
         if canonical_word_game_text(phrase).split()[-1] not in WORD_GAME_BLOCKED_OPENING_WORDS
     ]
     return random.choice(word_game_start_pool or fallback_starts or START_PHRASES)
+
+
+def phrase_has_forbidden(phrase):
+    """Cụm chứa từ chủ bot cấm chơi (vd 'rồi') -> cấm cả bot lẫn người chơi."""
+    return any(
+        word in WORD_GAME_FORBIDDEN_WORDS
+        for word in canonical_word_game_text(phrase).split()
+    )
 
 
 def reverses_used_phrase(phrase, used_phrases):
@@ -2502,6 +2522,16 @@ async def handle_word_game_session(message, prompt, session):
         return
     if phrase_has_foreign(phrase_key):
         await register_word_game_strike(message, session, phrase_key, foreign=True)
+        return
+    if phrase_has_forbidden(phrase_key):
+        bad = next(
+            (w for w in canonical_word_game_text(phrase_key).split() if w in WORD_GAME_FORBIDDEN_WORDS),
+            "đó",
+        )
+        await register_word_game_strike(
+            message, session, phrase_key,
+            reason=f'"{bad}" là từ cấm trong game, đổi từ khác đi',
+        )
         return
     # Tách lý do strike để báo ĐÚNG lỗi: 'thừa' vs 'thửa' nhìn gần giống nhau,
     # báo 'là cái deo j' làm người chơi tưởng từ vô nghĩa rồi thua oan cả ván.
