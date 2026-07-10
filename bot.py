@@ -2075,17 +2075,21 @@ async def attach_game_feedback(sent_message, session, kind, phrase):
         return
     _prune_feedback()
     if session.get("player_id") == OWNER_ID:
-        # Ván chủ bot: chỉ gắn trên câu BOT nối (📝+☠️) và tin chấm sai/bí (📝 dạy);
-        # câu chủ bot tự gõ không cần emoji.
-        if kind == "bot_move":
-            emojis = [FEEDBACK_EMOJI, DEADWORD_EMOJI]
-        elif kind == "teach":
-            emojis = [FEEDBACK_EMOJI]
-        else:
-            return
-    elif kind in ("bot_move", "player_move"):
-        emojis = [DELETE_EMOJI]
+        # Ván chủ bot: câu BOT nối 📝(sai)+☠️(từ chết); câu CHỦ BOT gõ ☠️(từ chết,
+        # bot học để dùng); tin chấm sai/bí 📝(dạy từ).
+        emojis = {
+            "bot_move": [FEEDBACK_EMOJI, DEADWORD_EMOJI],
+            "player_move": [DEADWORD_EMOJI],
+            "teach": [FEEDBACK_EMOJI],
+        }.get(kind, [])
     else:
+        # Ván người khác: câu người chơi & bot ❌(cấm)+☠️(từ chết, bot học); tin bí/thua 📝(dạy).
+        emojis = {
+            "bot_move": [DELETE_EMOJI, DEADWORD_EMOJI],
+            "player_move": [DELETE_EMOJI, DEADWORD_EMOJI],
+            "teach": [FEEDBACK_EMOJI],
+        }.get(kind, [])
+    if not emojis:
         return
     feedback_targets[sent_message.id] = {
         "kind": kind,
@@ -3690,17 +3694,50 @@ _synced = False
 _backup_started = False
 
 
+def _phrase_from_message(msg):
+    """Đọc cụm 2 từ từ nội dung tin nối từ (câu bot **X Y**... N hoặc câu người chơi X Y)."""
+    content = msg.content or ""
+    m = re.search(r"\*\*([^\*]+?)\*\*", content)
+    candidate = m.group(1) if m else content
+    candidate = re.sub(r"<@!?\d+>", " ", candidate)
+    candidate = re.sub(r"\.\.\.\s*\d+\s*$", "", candidate).strip()
+    canonical = canonical_word_game_text(candidate)
+    return canonical if len(canonical.split()) == 2 else None
+
+
+async def _resolve_feedback(payload):
+    """(kind, phrase). Ưu tiên feedback_targets đang chạy; hết thì đọc lại từ nội dung tin
+    -> trận cũ / sau khi bot restart vẫn bấm emoji được."""
+    _prune_feedback()
+    target = feedback_targets.get(payload.message_id)
+    if target is not None:
+        return target["kind"], target["phrase"]
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return None, None
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return None, None
+    is_bot = bool(bot.user and msg.author.id == bot.user.id)
+    phrase = _phrase_from_message(msg)
+    if phrase:
+        return ("bot_move" if is_bot else "player_move"), phrase
+    if is_bot:
+        return "teach", ""  # tin bí/thua/chấm sai của bot -> dạy từ
+    return None, None
+
+
 @bot.event
 async def on_raw_reaction_add(payload):
-    """Emoji feedback nối từ, chỉ chủ bot: 📝 (sai/dạy), ☠️ (từ chết), ❌ (cấm cụm ván người khác)."""
+    """Emoji feedback nối từ, chỉ chủ bot: 📝 (sai/dạy), ☠️ (từ chết + học), ❌ (cấm cụm)."""
     if payload.user_id != OWNER_ID:
         return
     emoji = str(payload.emoji)
     if emoji not in (FEEDBACK_EMOJI, DEADWORD_EMOJI, DELETE_EMOJI):
         return
-    _prune_feedback()
-    target = feedback_targets.get(payload.message_id)
-    if target is None:
+    kind, phrase = await _resolve_feedback(payload)
+    if kind is None:
         return
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
@@ -3708,38 +3745,37 @@ async def on_raw_reaction_add(payload):
     key = (payload.message_id, emoji)
     try:
         if emoji == DEADWORD_EMOJI:
-            # ☠️ chỉ có nghĩa trên câu bot nối: chữ cuối cụm đó là TỪ CHẾT.
-            if target["kind"] != "bot_move":
-                return
-            words = canonical_word_game_text(target["phrase"]).split()
-            if not words:
+            canonical = canonical_word_game_text(phrase)
+            words = canonical.split()
+            if len(words) != 2:
                 return
             dead = words[-1]
             owner_dead_words.add(dead)
             save_owner_feedback()
-            reaction_undo[key] = {"type": "dead", "word": dead}
-            await channel.send(
-                f'ok, "{dead}" là từ chết ☠️ — từ giờ ván nào bị dồn tới "{dead}" là thua luôn'
-            )
-        elif emoji == DELETE_EMOJI or target["kind"] in ("bot_move", "player_move"):
-            # ❌ (ván người khác) hoặc 📝 trên câu nối: cụm SAI, gạch vĩnh viễn.
-            canonical = canonical_word_game_text(target["phrase"])
-            flag_phrase_invalid(target["phrase"])
-            reaction_undo[key] = {"type": "invalid", "phrase": canonical}
-            await channel.send(
-                f'ok, t gạch "{target["phrase"]}" khỏi từ điển, không dùng lại nữa'
-            )
-        else:
-            # 📝 trên tin chấm sai/bí từ: mở phiên dạy, chủ bot reply cụm đúng để bot học.
+            undo = {"type": "dead", "word": dead}
+            text = f'ok, "{dead}" là từ chết ☠️ — từ giờ dồn tới "{dead}" là thua luôn'
+            if kind == "player_move":
+                # Từ người chơi: bot HỌC cụm này để nối làm bẫy lần sau.
+                learn_word_phrase(canonical)
+                undo["learned"] = canonical
+                text += f'; t học "{phrase}" để nối lại'
+            reaction_undo[key] = undo
+            await channel.send(text)
+        elif kind == "teach":
+            # 📝 trên tin bí/chấm sai: mở phiên dạy, chủ bot reply cụm đúng.
             prompt = await channel.send(
                 "từ đúng là gì? reply tin này với đúng cụm 2 từ, t học luôn"
             )
-            undo_key = key
-            pending_teach[prompt.id] = {
-                "expires": time.time() + FEEDBACK_EXPIRE_SECONDS,
-                "undo_key": undo_key,
-            }
-            reaction_undo[undo_key] = {"type": "teach", "prompt_id": prompt.id, "learned": None}
+            pending_teach[prompt.id] = {"expires": time.time() + FEEDBACK_EXPIRE_SECONDS, "undo_key": key}
+            reaction_undo[key] = {"type": "teach", "prompt_id": prompt.id, "learned": None}
+        else:
+            # 📝 hoặc ❌ trên câu nối: cụm SAI, gạch vĩnh viễn.
+            canonical = canonical_word_game_text(phrase)
+            if len(canonical.split()) != 2:
+                return
+            flag_phrase_invalid(canonical)
+            reaction_undo[key] = {"type": "invalid", "phrase": canonical}
+            await channel.send(f'ok, t gạch "{phrase}" khỏi từ điển, không dùng lại nữa')
     except discord.HTTPException as exc:
         log.warning("Feedback nối từ lỗi: %s", exc)
 
@@ -3762,6 +3798,8 @@ async def on_raw_reaction_remove(payload):
         elif info["type"] == "dead":
             owner_dead_words.discard(info["word"])
             save_owner_feedback()
+            if info.get("learned"):
+                unlearn_phrase(info["learned"])
             if channel:
                 await channel.send(f'ok gỡ, "{info["word"]}" hết là từ chết')
         elif info["type"] == "teach":
