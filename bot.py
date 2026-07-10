@@ -2310,6 +2310,12 @@ async def handle_word_game_session(message, prompt, session):
             message, session, phrase_key, reason="cụm đó dùng rồi, đổi cụm khác",
         )
         return
+    # Cấm ĐẢO NGƯỢC cụm đã dùng (dán tem -> tem dán) để lách luật nối lại về từ cũ.
+    if reverses_used_phrase(phrase_key, session["used_phrases"]):
+        await register_word_game_strike(
+            message, session, phrase_key, reason="cấm đảo ngược cụm đã dùng nha, đổi cụm khác",
+        )
+        return
     if await judge_word_game_phrase(phrase_key, source="người chơi") is False:
         await register_word_game_strike(message, session, phrase_key)
         return
