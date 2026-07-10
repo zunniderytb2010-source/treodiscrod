@@ -86,6 +86,10 @@ SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
 LEARNED_BACKUP_FILENAME = "learned_words_backup.json"
 OWNER_FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner_feedback.json")
 OWNER_FEEDBACK_BACKUP_FILENAME = "owner_feedback_backup.json"
+# Kênh nhận file từ điển thô sau mỗi ván + tổng hợp gomtu/gheptu.
+WORD_LIST_CHANNEL_ID = int(os.getenv("WORD_LIST_CHANNEL_ID", "1525141086371188867") or 0)
+WORD_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "word_stats.json")
+WORD_STATS_BACKUP_FILENAME = "word_stats_backup.json"
 MAINTENANCE_RESTORE_DELAY_SECONDS = 20
 # Emoji feedback nối từ, chỉ chủ bot: bấm trên câu bot nối = từ đó sai;
 # bấm trên câu chấm sai/bí từ = muốn dạy từ đúng.
@@ -718,6 +722,10 @@ def _build_backup_files():
             io.BytesIO(json.dumps(_owner_feedback_payload(), ensure_ascii=False).encode("utf-8")),
             filename=OWNER_FEEDBACK_BACKUP_FILENAME,
         ),
+        discord.File(
+            io.BytesIO(json.dumps(_word_stats_payload(), ensure_ascii=False).encode("utf-8")),
+            filename=WORD_STATS_BACKUP_FILENAME,
+        ),
     ]
 
 
@@ -776,9 +784,10 @@ async def restore_game_backup_from_dm():
     need_sessions = not (local_sessions.get("sessions") or local_sessions.get("refunds"))
     need_learned = not os.path.exists(LEARNED_WORDS_FILE)
     need_feedback = not os.path.exists(OWNER_FEEDBACK_FILE)
+    need_stats = not os.path.exists(WORD_STATS_FILE)
     if (
         not need_profiles and not need_unknown and not need_sessions
-        and not need_learned and not need_feedback
+        and not need_learned and not need_feedback and not need_stats
     ):
         return
     try:
@@ -857,6 +866,19 @@ async def restore_game_backup_from_dm():
                         )
                     except OSError as exc:
                         log.warning("Không ghi được file feedback: %s", exc)
+            elif need_stats and attachment.filename == WORD_STATS_BACKUP_FILENAME:
+                try:
+                    raw = json.loads((await attachment.read()).decode("utf-8"))
+                except (json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup word_stats trong DM lỗi: %s", exc)
+                    continue
+                if isinstance(raw, dict) and (raw.get("collected") or raw.get("stuck")):
+                    try:
+                        with open(WORD_STATS_FILE, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, ensure_ascii=False)
+                        log.info("Đã khôi phục word_stats từ backup DM")
+                    except OSError as exc:
+                        log.warning("Không ghi được file word_stats: %s", exc)
     except discord.HTTPException as exc:
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
 
@@ -1385,6 +1407,10 @@ owner_dead_words = set()            # từ chủ bot đánh dấu TỪ CHẾT qu
 owner_verified_phrases = set()      # cụm chủ bot đã tích ✅ ĐÚNG: lần sau chỉ hiện 🔒, khỏi kiểm lại
 reaction_undo = {}                  # (message_id, emoji) -> hành động đã làm, để gỡ emoji thì hoàn tác
 ghitu_sessions = {}                 # owner_id -> phiên nhập hàng loạt !ghitu (invalid -> dead -> valid)
+collected_phrases = []              # tất cả cụm bot thu thập qua các ván (thứ tự, không trùng)
+_collected_set = set()              # bản set để check trùng nhanh
+gomtu_exported = set()              # cụm đã xuất bằng gomtu -> lần sau không gom lại
+bot_stuck_words = []                # từ người chơi nói mà bot bí (bot không biết nối tiếp), trừ từ chết
 
 
 def _merge_external_dict(path, source_label, mark_external=True):
@@ -1493,6 +1519,72 @@ def flag_phrase_invalid(phrase):
     save_owner_feedback()
 
 
+def _word_stats_payload():
+    return {
+        "collected": collected_phrases,
+        "gomtu_exported": sorted(gomtu_exported),
+        "stuck": bot_stuck_words,
+    }
+
+
+def load_word_stats():
+    global collected_phrases, _collected_set, gomtu_exported, bot_stuck_words
+    try:
+        with open(WORD_STATS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            collected_phrases = [p for p in data.get("collected", []) if isinstance(p, str)]
+            _collected_set = set(collected_phrases)
+            gomtu_exported = {p for p in data.get("gomtu_exported", []) if isinstance(p, str)}
+            bot_stuck_words = [w for w in data.get("stuck", []) if isinstance(w, str)]
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def save_word_stats():
+    global _game_backup_dirty
+    try:
+        temp = WORD_STATS_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(_word_stats_payload(), handle, ensure_ascii=False)
+        os.replace(temp, WORD_STATS_FILE)
+        _game_backup_dirty = True
+    except OSError as exc:
+        log.warning("Không lưu được word_stats: %s", exc)
+
+
+def collect_match_words(session):
+    """Gom mọi cụm hợp lệ của ván (theo thứ tự chơi) vào kho thu thập; trả list cụm của ván."""
+    ordered, seen = [], set()
+    for item in session.get("game_messages", []):
+        phrase = _phrase_from_message(item)
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            ordered.append(phrase)
+    for phrase in sorted(session.get("used_phrases", set())):
+        if phrase not in seen:
+            seen.add(phrase)
+            ordered.append(phrase)
+    changed = False
+    for phrase in ordered:
+        if phrase not in _collected_set:
+            _collected_set.add(phrase)
+            collected_phrases.append(phrase)
+            changed = True
+    if changed:
+        save_word_stats()
+    return ordered
+
+
+def record_bot_stuck_word(word):
+    """Bot bí ở từ này (không biết nối) -> ghi lại cho gheptu, trừ từ chết cố ý."""
+    word = (word or "").strip()
+    if not word or word in owner_dead_words or word in bot_stuck_words:
+        return
+    bot_stuck_words.append(word)
+    save_word_stats()
+
+
 def unflag_phrase_invalid(phrase):
     """Hoàn tác flag_phrase_invalid: cụm dùng lại được, trả về từ điển."""
     canonical = canonical_word_game_text(phrase)
@@ -1551,6 +1643,7 @@ def load_external_dictionaries():
             learned_words = {k: list(v) for k, v in data.items() if isinstance(v, list)}
     except (OSError, json.JSONDecodeError):
         learned_words = {}
+    load_word_stats()
 
 
 def save_learned_words():
@@ -1981,9 +2074,28 @@ def build_word_game_transcript(session, won):
     return "\n".join(lines) + "\n"
 
 
+async def _send_raw_match_words(session, match_phrases):
+    """Gửi file txt CHỈ có các cụm của ván (mỗi cụm 1 dòng, không thêm gì) vào kênh từ điển."""
+    if not WORD_LIST_CHANNEL_ID or not match_phrases:
+        return
+    channel = bot.get_channel(WORD_LIST_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(WORD_LIST_CHANNEL_ID)
+        except discord.HTTPException:
+            return
+    data = ("\n".join(match_phrases) + "\n").encode("utf-8")
+    filename = f"{session.get('game_id', 'match')}.txt"
+    try:
+        await channel.send(file=discord.File(io.BytesIO(data), filename=filename))
+    except discord.HTTPException as exc:
+        log.warning("Không gửi được file từ của ván: %s", exc)
+
+
 async def archive_and_cleanup_word_game(session, source_channel, won):
-    """Gửi biên bản ván vào kênh lưu; GIỮ NGUYÊN tin nhắn trong kênh (không xóa) để
-    chủ bot còn bấm emoji chấm/cấm cụm sau ván."""
+    """Gửi biên bản ván vào kênh lưu + file từ thô vào kênh từ điển; GIỮ NGUYÊN tin nhắn."""
+    match_phrases = collect_match_words(session)
+    await _send_raw_match_words(session, match_phrases)
     log_channel = find_word_game_log_channel(source_channel)
     if log_channel is None:
         return False
@@ -2172,6 +2284,8 @@ async def finish_word_game_win(message, session):
     update_game_result(profile, won=True)
     cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
+    # Bot bí ở 'last_word' -> ghi lại cho gheptu (từ người chơi nói mà bot không biết nối).
+    record_bot_stuck_word(session.get("last_word", ""))
     sent = await send_word_game_reply(
         message,
         session,
@@ -3992,6 +4106,37 @@ async def on_message(message):
     lowered = content.lower()
     key = (message.channel.id, message.author.id)
     has_game_session = key in word_game_sessions
+
+    # gomtu: gom tất cả cụm bot thu thập (chưa gom lần trước) thành 1 hàng dài.
+    if message.author.id == OWNER_ID and re.fullmatch(r"!?gomtu", content.strip(), re.IGNORECASE):
+        ensure_word_game_dictionary()  # đảm bảo đã nạp word_stats (sau restore)
+        new_phrases = [p for p in collected_phrases if p not in gomtu_exported]
+        if not new_phrases:
+            await send_reply(message, "chưa có cụm mới nào để gom", remember=False)
+            return
+        data = (", ".join(new_phrases)).encode("utf-8")
+        await message.reply(
+            f"gom {len(new_phrases)} cụm mới (tổng thu thập {len(collected_phrases)})",
+            file=discord.File(io.BytesIO(data), filename="gomtu.txt"),
+            mention_author=False,
+        )
+        gomtu_exported.update(new_phrases)
+        save_word_stats()
+        return
+    # gheptu: xuất các từ người chơi nói mà bot bí (để thêm từ ghép), trừ từ chết.
+    if message.author.id == OWNER_ID and re.fullmatch(r"!?gheptu", content.strip(), re.IGNORECASE):
+        ensure_word_game_dictionary()
+        words = [w for w in bot_stuck_words if w not in owner_dead_words]
+        if not words:
+            await send_reply(message, "chưa có từ nào bot bí để ghép", remember=False)
+            return
+        data = ("\n".join(words) + "\n").encode("utf-8")
+        await message.reply(
+            f"{len(words)} từ bot bí (người chơi nói mà bot không biết nối) — thêm từ ghép cho mấy từ này",
+            file=discord.File(io.BytesIO(data), filename="gheptu.txt"),
+            mention_author=False,
+        )
+        return
 
     # Lệnh !ghitu (chỉ chủ bot): mở wizard nhập hàng loạt invalid -> dead -> valid.
     if message.author.id == OWNER_ID and content.strip().lower() == "!ghitu":

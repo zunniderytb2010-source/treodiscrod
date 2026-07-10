@@ -11,3 +11,5 @@ learned_words.json
 learned_words.json.tmp
 owner_feedback.json
 owner_feedback.json.tmp
+word_stats.json
+word_stats.json.tmp
