@@ -1559,26 +1559,27 @@ def save_word_stats():
 
 
 def compute_bot_avoid_words():
-    """Từ V mà đối thủ có thể nối 'V + từ_chết' -> nếu bot kết ở V, đối thủ dồn bot vào từ chết."""
+    """Từ V mà đối thủ nối 'V + từ_chết/từ_bot_bí' -> nếu bot kết ở V, đối thủ dồn bot vào chỗ chết."""
     ensure_word_game_dictionary()
+    dead = owner_dead_words | set(bot_stuck_words)
     avoid = set()
-    if not owner_dead_words:
+    if not dead:
         return avoid
     for key, phrases in word_game_response_map.items():
         for phrase in phrases:
             words = canonical_word_game_text(phrase).split()
-            if len(words) == 2 and words[1] in owner_dead_words:
+            if len(words) == 2 and words[1] in dead:
                 avoid.add(words[0])
                 break
     return avoid
 
 
 def refresh_bot_avoid_words():
-    """TỰ HỌC: cập nhật danh sách từ dẫn tới từ chết để bot né kết thúc ở đó (bí quá mới dùng)."""
+    """TỰ HỌC (tích luỹ, KHÔNG xoá cái đã học từ kinh nghiệm): gộp thêm từ dẫn tới chỗ chết."""
     global bot_avoid_end_words
-    new = compute_bot_avoid_words()
-    if new != bot_avoid_end_words:
-        bot_avoid_end_words = new
+    computed = compute_bot_avoid_words()
+    if not computed.issubset(bot_avoid_end_words):
+        bot_avoid_end_words |= computed
         save_owner_feedback()
 
 
@@ -2356,6 +2357,11 @@ async def finish_word_game_win(message, session):
     word_game_sessions.pop(key, None)
     # Bot bí ở 'last_word' -> ghi lại cho gheptu (từ người chơi nói mà bot không biết nối).
     record_bot_stuck_word(session.get("last_word", ""))
+    # TỰ HỌC ngay: bot vừa kết ở từ đầu của cụm cuối rồi bị dồn tới từ bí -> NÉ từ đó lần sau.
+    trap = canonical_word_game_text(session.get("current_phrase", "")).split()
+    if len(trap) == 2 and trap[0] not in bot_avoid_end_words:
+        bot_avoid_end_words.add(trap[0])
+        save_owner_feedback()
     sent = await send_word_game_reply(
         message,
         session,
