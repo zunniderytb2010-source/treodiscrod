@@ -84,7 +84,14 @@ UNKNOWN_BACKUP_FILENAME = "unknown_words_backup.json"
 WORD_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "word_game_sessions.json")
 SESSIONS_BACKUP_FILENAME = "word_sessions_backup.json"
 LEARNED_BACKUP_FILENAME = "learned_words_backup.json"
+OWNER_FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner_feedback.json")
+OWNER_FEEDBACK_BACKUP_FILENAME = "owner_feedback_backup.json"
 MAINTENANCE_RESTORE_DELAY_SECONDS = 20
+# Emoji feedback nối từ, chỉ chủ bot: bấm trên câu bot nối = từ đó sai;
+# bấm trên câu chấm sai/bí từ = muốn dạy từ đúng.
+FEEDBACK_EMOJI = "📝"
+FEEDBACK_EXPIRE_SECONDS = 10 * 60
+OWNER_CLEANUP_DELAY_SECONDS = 120  # ván của chủ bot giữ tin lâu hơn để kịp feedback
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_START_BALANCE = 10_000
@@ -699,6 +706,10 @@ def _build_backup_files():
             io.BytesIO(json.dumps(learned_words, ensure_ascii=False).encode("utf-8")),
             filename=LEARNED_BACKUP_FILENAME,
         ),
+        discord.File(
+            io.BytesIO(json.dumps({"invalid": sorted(owner_invalid_phrases)}, ensure_ascii=False).encode("utf-8")),
+            filename=OWNER_FEEDBACK_BACKUP_FILENAME,
+        ),
     ]
 
 
@@ -716,9 +727,10 @@ async def _find_backup_message(dm):
 async def send_game_backup():
     """Giữ đúng 1 tin DM chứa backup, data đổi thì edit tại chỗ thay vì gửi tin mới."""
     global _game_backup_dirty, _backup_message
-    if not game_profiles and not unknown_word_phrases and not _pending_refunds:
-        # Không bao giờ đè backup đang có dữ liệu bằng trạng thái rỗng (vd instance
-        # mới boot chưa kịp khôi phục) - đây là cách profile bị mất vĩnh viễn.
+    if not game_profiles:
+        # Profile là dữ liệu quý nhất; trống (chưa kịp khôi phục / file hỏng) thì
+        # TUYỆT ĐỐI không ghi đè backup, kể cả khi log/từ học có data. Lỗ hổng cũ:
+        # chỉ chặn khi TẤT CẢ rỗng -> profile rỗng + log có data vẫn đè -> bay tài khoản.
         _game_backup_dirty = False
         return
     content = f"backup game tự động, đừng xoá tin này; cập nhật <t:{int(time.time())}:R>"
@@ -755,7 +767,11 @@ async def restore_game_backup_from_dm():
     local_sessions = _load_local_session_data()
     need_sessions = not (local_sessions.get("sessions") or local_sessions.get("refunds"))
     need_learned = not os.path.exists(LEARNED_WORDS_FILE)
-    if not need_profiles and not need_unknown and not need_sessions and not need_learned:
+    need_feedback = not os.path.exists(OWNER_FEEDBACK_FILE)
+    if (
+        not need_profiles and not need_unknown and not need_sessions
+        and not need_learned and not need_feedback
+    ):
         return
     try:
         owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
@@ -816,6 +832,19 @@ async def restore_game_backup_from_dm():
                         log.info("Đã khôi phục %s từ đã học từ backup DM", len(raw))
                     except OSError as exc:
                         log.warning("Không ghi được file từ đã học: %s", exc)
+            elif need_feedback and attachment.filename == OWNER_FEEDBACK_BACKUP_FILENAME:
+                try:
+                    raw = json.loads((await attachment.read()).decode("utf-8"))
+                except (json.JSONDecodeError, discord.HTTPException) as exc:
+                    log.warning("Backup feedback trong DM lỗi: %s", exc)
+                    continue
+                if isinstance(raw, dict) and raw.get("invalid"):
+                    try:
+                        with open(OWNER_FEEDBACK_FILE, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, ensure_ascii=False)
+                        log.info("Đã khôi phục %s cụm feedback từ backup DM", len(raw["invalid"]))
+                    except OSError as exc:
+                        log.warning("Không ghi được file feedback: %s", exc)
     except discord.HTTPException as exc:
         log.warning("Không đọc được DM để khôi phục backup: %s", exc)
 
@@ -1338,7 +1367,11 @@ LEARNED_WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "l
 _external_dict_loaded = False
 
 
-def _merge_external_dict(path, source_label):
+word_game_external_phrases = set()  # cụm Viet74K: chỉ dùng CHẤM từ người chơi, bot hạn chế tự nói (nhiều từ hiếm/cổ)
+owner_invalid_phrases = set()       # cụm chủ bot đánh dấu SAI qua emoji feedback, cấm vĩnh viễn
+
+
+def _merge_external_dict(path, source_label, mark_external=True):
     """Nạp từ điển ngoài dạng {từ_đầu: [từ_sau,...]} và merge vào RESPONSE_MAP, lọc rác."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -1348,6 +1381,7 @@ def _merge_external_dict(path, source_label):
     if not isinstance(data, dict):
         return 0
     invalid = {canonical_word_game_text(item) for item in WORD_GAME_ALWAYS_INVALID}
+    invalid |= owner_invalid_phrases
     added = 0
     for key, seconds in data.items():
         if not isinstance(seconds, list) or not isinstance(key, str):
@@ -1370,6 +1404,8 @@ def _merge_external_dict(path, source_label):
                 continue
             bucket.append(phrase)
             existing.add(phrase)
+            if mark_external:
+                word_game_external_phrases.add(canonical_word_game_text(phrase))
             added += 1
     if added:
         log.info("Đã nạp %s cụm từ %s", added, source_label)
@@ -1379,13 +1415,62 @@ def _merge_external_dict(path, source_label):
 learned_words = {}  # {từ_đầu: [từ_sau,...]} bot tự học từ AI, lưu bền qua file + backup
 
 
+def load_owner_feedback():
+    global owner_invalid_phrases
+    try:
+        with open(OWNER_FEEDBACK_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict) and isinstance(data.get("invalid"), list):
+            owner_invalid_phrases = {canonical_word_game_text(p) for p in data["invalid"] if isinstance(p, str)}
+    except (OSError, json.JSONDecodeError):
+        owner_invalid_phrases = set()
+
+
+def save_owner_feedback():
+    global _game_backup_dirty
+    try:
+        temp = OWNER_FEEDBACK_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump({"invalid": sorted(owner_invalid_phrases)}, handle, ensure_ascii=False)
+        os.replace(temp, OWNER_FEEDBACK_FILE)
+        _game_backup_dirty = True
+    except OSError as exc:
+        log.warning("Không lưu được owner_feedback: %s", exc)
+
+
+def flag_phrase_invalid(phrase):
+    """Chủ bot đánh dấu cụm SAI: cấm vĩnh viễn, gỡ khỏi mọi kho từ."""
+    canonical = canonical_word_game_text(phrase)
+    words = canonical.split()
+    if len(words) != 2:
+        return
+    owner_invalid_phrases.add(canonical)
+    key = words[0]
+    # Gỡ khỏi kho gốc + kho đã index + từ đã học + cache chấm.
+    if key in RESPONSE_MAP:
+        RESPONSE_MAP[key] = [p for p in RESPONSE_MAP[key] if canonical_word_game_text(p) != canonical]
+    if word_game_response_map is not None and key in word_game_response_map:
+        word_game_response_map[key] = [
+            p for p in word_game_response_map[key] if canonical_word_game_text(p) != canonical
+        ]
+    if word_game_dictionary_phrases is not None:
+        word_game_dictionary_phrases.discard(canonical)
+    if key in learned_words and words[1] in learned_words[key]:
+        learned_words[key].remove(words[1])
+        save_learned_words()
+    word_game_validity_cache[canonical] = False
+    save_owner_feedback()
+
+
 def load_external_dictionaries():
     global _external_dict_loaded, learned_words
     if _external_dict_loaded:
         return
     _external_dict_loaded = True
+    load_owner_feedback()  # nạp danh sách cụm chủ bot đã đánh dấu sai TRƯỚC khi merge
     _merge_external_dict(VN_DICT_FILE, "từ điển tiếng Việt")
-    _merge_external_dict(LEARNED_WORDS_FILE, "từ đã học")
+    # Từ đã học đến từ AI + chủ bot dạy nên coi là cụm "quen", bot được tự nói.
+    _merge_external_dict(LEARNED_WORDS_FILE, "từ đã học", mark_external=False)
     try:
         with open(LEARNED_WORDS_FILE, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -1535,12 +1620,19 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
             and not reverses_used_phrase(normalized, used_phrases)
             and not any(word in WORD_GAME_BANNED_WORDS for word in words)
             and normalized not in WORD_GAME_BOT_AVOID_PHRASES
+            and normalized not in owner_invalid_phrases
             and words[0] != words[1]  # cấm bịa kiểu "nhàng nhàng", "queo queo"
             and not phrase_has_foreign(phrase)  # bot chỉ nói tiếng Việt
         ):
             candidates.append((phrase, normalized, words[-1]))
     if not candidates:
         return None
+
+    # Bot ưu tiên cụm PHỔ THÔNG (kho curated + từ đã học). Viet74K nhiều từ hiếm/cổ
+    # (nhau nhảu, của thửa) chỉ dùng cứu bí khi không còn lựa chọn quen thuộc,
+    # không thì bot thành máy phun từ cổ khiến người chơi tưởng bot bịa.
+    curated = [c for c in candidates if c[1] not in word_game_external_phrases]
+    candidates = curated or candidates
 
     # Bỏ hậu tố filler nếu còn lựa chọn tự nhiên khác.
     non_filler = [c for c in candidates if c[2] not in WORD_GAME_FILLER_WORDS]
@@ -1628,6 +1720,9 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
     canonical = canonical_word_game_text(phrase)
     # Nối từ chỉ tiếng Việt: có từ tiếng Anh là loại luôn.
     if phrase_has_foreign(phrase):
+        return False
+    # Cụm chủ bot từng đánh dấu sai qua emoji feedback: cấm vĩnh viễn.
+    if canonical in owner_invalid_phrases:
         return False
     # Cụm đã nằm trong từ điển tĩnh thì đương nhiên hợp lệ, khỏi hỏi AI (tránh 'chưa rõ' oan).
     if canonical in word_game_dictionary_phrases:
@@ -1912,21 +2007,59 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=W
                 allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
             )
             record_word_game_message(session, sent)
-            await archive_and_cleanup_word_game(session, bot_message.channel, won=False)
+            # Chủ bot: gắn feedback + giữ tin lâu hơn để kịp ý kiến vụ hết giờ.
+            await attach_owner_feedback(sent, session, "teach", session.get("last_word", ""))
+            if session.get("player_id") == OWNER_ID:
+                asyncio.create_task(_archive_after_feedback(session, bot_message.channel, False))
+            else:
+                await archive_and_cleanup_word_game(session, bot_message.channel, won=False)
     except asyncio.CancelledError:
         raise
     except discord.HTTPException as exc:
         log.warning("Đếm giờ nối từ lỗi: %s", exc)
 
 
-async def register_word_game_strike(message, session, phrase_key, profane=False, foreign=False):
+# ==================== EMOJI FEEDBACK (chỉ chủ bot) ====================
+feedback_targets = {}  # message_id -> {"kind": "bot_move"/"teach", "phrase": str, "expires": ts}
+pending_teach = {}     # prompt_message_id -> expires; chủ bot reply tin này để dạy từ
+
+
+def _prune_feedback():
+    now = time.time()
+    for store in (feedback_targets, pending_teach):
+        for mid in [m for m, v in store.items()
+                    if (v["expires"] if isinstance(v, dict) else v) < now]:
+            store.pop(mid, None)
+
+
+async def attach_owner_feedback(sent_message, session, kind, phrase):
+    """Ván của chủ bot: gắn emoji 📝 để chấm/dạy từ ngay trong game."""
+    if session.get("player_id") != OWNER_ID or sent_message is None:
+        return
+    _prune_feedback()
+    feedback_targets[sent_message.id] = {
+        "kind": kind,
+        "phrase": phrase or "",
+        "expires": time.time() + FEEDBACK_EXPIRE_SECONDS,
+    }
+    try:
+        await sent_message.add_reaction(FEEDBACK_EMOJI)
+    except discord.HTTPException:
+        pass
+
+
+async def register_word_game_strike(message, session, phrase_key, profane=False, foreign=False, reason=None):
     """Từ sai/vô nghĩa không thua ngay: khịa tăng dần, đủ 4 lần trong ván mới xử thua."""
     session["strikes"] = session.get("strikes", 0) + 1
     strikes = session["strikes"]
     if strikes >= WORD_GAME_MAX_STRIKES:
         await finish_word_game_loss(message, session, "sai lần 4 rồi, hết cứu")
         return
-    if foreign:
+    if reason:
+        # Lý do cụ thể (sai chữ đầu, cụm dùng rồi): nói thẳng để người chơi biết sửa gì,
+        # không dùng câu 'là cái deo j' gây hiểu nhầm là từ vô nghĩa.
+        text = reason
+    elif foreign:
         text = "nối từ tiếng Việt thôi nha, tiếng Anh không tính" if strikes <= 2 else "??"
     elif profane:
         # Không lặp lại từ tục trong câu trả lời.
@@ -1942,7 +2075,29 @@ async def register_word_game_strike(message, session, phrase_key, profane=False,
     sent = await send_word_game_reply(
         message, session, f"{text}... {WORD_GAME_TURN_SECONDS}",
     )
+    # Chủ bot bấm 📝 trên tin chấm sai này = bot chấm oan, muốn dạy từ đúng.
+    await attach_owner_feedback(sent, session, "teach", phrase_key)
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
+
+
+async def _archive_after_feedback(session, channel, won):
+    """Ván chủ bot: giữ tin lâu hơn để kịp bấm 📝/dạy từ; dạy dở thì chờ thêm rồi mới dọn."""
+    await asyncio.sleep(OWNER_CLEANUP_DELAY_SECONDS)
+    for _ in range(18):  # tối đa chờ thêm 3 phút nếu đang dở phiên dạy từ
+        _prune_feedback()
+        if not pending_teach:
+            break
+        await asyncio.sleep(10)
+    for item in session.get("game_messages", []):
+        feedback_targets.pop(getattr(item, "id", 0), None)
+    await archive_and_cleanup_word_game(session, channel, won)
+
+
+async def _finish_cleanup(message, session, won):
+    if session.get("player_id") == OWNER_ID:
+        asyncio.create_task(_archive_after_feedback(session, message.channel, won))
+    else:
+        await archive_and_cleanup_word_game(session, message.channel, won)
 
 
 async def finish_word_game_win(message, session):
@@ -1953,12 +2108,14 @@ async def finish_word_game_win(message, session):
     update_game_result(profile, won=True)
     cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
-    await send_word_game_reply(
+    sent = await send_word_game_reply(
         message,
         session,
         f"t bí từ rồi\nm thắng +{prize:,}đ\nsố dư giờ: {profile['balance']:,}đ",
     )
-    await archive_and_cleanup_word_game(session, message.channel, won=True)
+    # Chủ bot bấm 📝 trên tin bí từ = muốn dạy bot cụm nối được ở đây.
+    await attach_owner_feedback(sent, session, "teach", session.get("last_word", ""))
+    await _finish_cleanup(message, session, won=True)
 
 
 async def finish_word_game_loss(message, session, reason=""):
@@ -1968,12 +2125,14 @@ async def finish_word_game_loss(message, session, reason=""):
     cancel_word_game_timer(session)
     word_game_sessions.pop(key, None)
     prefix = f"{reason}\n" if reason else ""
-    await send_word_game_reply(
+    sent = await send_word_game_reply(
         message,
         session,
         f"{prefix}m thua mất {session['bet']:,}đ\nsố dư giờ: {profile['balance']:,}đ",
     )
-    await archive_and_cleanup_word_game(session, message.channel, won=False)
+    # Chủ bot bấm 📝 = xử thua này có vấn đề, muốn dạy/ý kiến.
+    await attach_owner_feedback(sent, session, "teach", session.get("last_word", ""))
+    await _finish_cleanup(message, session, won=False)
 
 
 async def handle_word_game_session(message, prompt, session):
@@ -2048,6 +2207,8 @@ async def handle_word_game_session(message, prompt, session):
             f"sai 4 lần thua, {WORD_GAME_TURN_SECONDS} giây mỗi lượt\n"
             f"\n**{start_phrase}**... {WORD_GAME_TURN_SECONDS}",
         )
+        # Chủ bot bấm 📝 trên câu bot nối = từ đó sai, gạch khỏi từ điển.
+        await attach_owner_feedback(sent, session, "bot_move", start_phrase)
         start_word_game_timer((message.channel.id, message.author.id), session, sent)
         return
 
@@ -2070,13 +2231,23 @@ async def handle_word_game_session(message, prompt, session):
     if phrase_has_foreign(phrase_key):
         await register_word_game_strike(message, session, phrase_key, foreign=True)
         return
-    if (
-        len(words) != 2
-        or words[0] != session["last_word"]
-        or phrase_key in session["used_phrases"]
-        or await judge_word_game_phrase(phrase_key, source="người chơi") is False
-    ):
-        # Sai chính tả, sai luật hay vô nghĩa đều tính strike, không thua ngay.
+    # Tách lý do strike để báo ĐÚNG lỗi: 'thừa' vs 'thửa' nhìn gần giống nhau,
+    # báo 'là cái deo j' làm người chơi tưởng từ vô nghĩa rồi thua oan cả ván.
+    if len(words) != 2:
+        await register_word_game_strike(message, session, phrase_key)
+        return
+    if words[0] != session["last_word"]:
+        await register_word_game_strike(
+            message, session, phrase_key,
+            reason=f'phải bắt đầu bằng "{session["last_word"]}" nha, m đang gõ "{words[0]}"',
+        )
+        return
+    if phrase_key in session["used_phrases"]:
+        await register_word_game_strike(
+            message, session, phrase_key, reason="cụm đó dùng rồi, đổi cụm khác",
+        )
+        return
+    if await judge_word_game_phrase(phrase_key, source="người chơi") is False:
         await register_word_game_strike(message, session, phrase_key)
         return
 
@@ -2106,6 +2277,8 @@ async def handle_word_game_session(message, prompt, session):
         session,
         f"**{response}**... {WORD_GAME_TURN_SECONDS}",
     )
+    # Chủ bot bấm 📝 trên câu bot nối = từ đó sai, gạch khỏi từ điển.
+    await attach_owner_feedback(sent, session, "bot_move", response)
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
 
@@ -3458,6 +3631,35 @@ _backup_started = False
 
 
 @bot.event
+async def on_raw_reaction_add(payload):
+    """Emoji feedback nối từ: chỉ chủ bot, chỉ emoji 📝, chỉ tin đã đăng ký."""
+    if payload.user_id != OWNER_ID or str(payload.emoji) != FEEDBACK_EMOJI:
+        return
+    _prune_feedback()
+    target = feedback_targets.pop(payload.message_id, None)
+    if target is None:
+        return
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    try:
+        if target["kind"] == "bot_move":
+            # Chủ bot bảo từ bot nối SAI: gạch vĩnh viễn khỏi mọi kho từ.
+            flag_phrase_invalid(target["phrase"])
+            await channel.send(
+                f'ok, t gạch "{target["phrase"]}" khỏi từ điển, không dùng lại nữa'
+            )
+        else:
+            # Bot chấm sai/bí từ: mở phiên dạy, chủ bot reply cụm đúng để bot học.
+            prompt = await channel.send(
+                "từ đúng là gì? reply tin này với đúng cụm 2 từ, t học luôn"
+            )
+            pending_teach[prompt.id] = time.time() + FEEDBACK_EXPIRE_SECONDS
+    except discord.HTTPException as exc:
+        log.warning("Feedback nối từ lỗi: %s", exc)
+
+
+@bot.event
 async def on_ready():
     global _synced, _backup_started
     log.info(f"Đã đăng nhập: {bot.user} (id={bot.user.id})")
@@ -3529,6 +3731,30 @@ async def on_message(message):
         prompt = extract_prompt(message)
     if text_economy_command and await handle_text_economy_command(message, content):
         return
+
+    # Chủ bot đang dạy từ (reply tin 'từ đúng là gì?'): học rồi dừng, không tính là lượt game.
+    if (
+        message.author.id == OWNER_ID
+        and message.reference
+        and message.reference.message_id in pending_teach
+    ):
+        pending_teach.pop(message.reference.message_id, None)
+        taught = canonical_word_game_text(content)
+        taught_words = taught.split()
+        if (
+            len(taught_words) == 2
+            and taught_words[0] != taught_words[1]
+            and not phrase_has_foreign(taught)
+            and not any(w in WORD_GAME_BANNED_WORDS for w in taught_words)
+        ):
+            word_game_validity_cache[taught] = True
+            owner_invalid_phrases.discard(taught)
+            learn_word_phrase(taught)
+            await send_reply(message, f'đã học "{taught}", lần sau t nhớ', remember=False)
+        else:
+            await send_reply(message, "cần đúng cụm 2 từ tiếng Việt nha, bấm 📝 rồi dạy lại", remember=False)
+        return
+
     invoked = is_ask or mentioned or wake or reply_to_bot
     if await handle_word_game_intents(message, prompt, invoked, ref):
         return

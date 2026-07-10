@@ -9,3 +9,5 @@ word_game_sessions.json
 word_game_sessions.json.tmp
 learned_words.json
 learned_words.json.tmp
+owner_feedback.json
+owner_feedback.json.tmp
