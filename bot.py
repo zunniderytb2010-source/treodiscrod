@@ -1553,16 +1553,23 @@ def save_word_stats():
         log.warning("Không lưu được word_stats: %s", exc)
 
 
+def _phrase_is_reviewed(canonical):
+    """Cụm đã được chủ bot xử lý rồi (xác minh đúng / cấm / có từ chết) -> khỏi ghi vào file nữa."""
+    if canonical in owner_verified_phrases or canonical in owner_invalid_phrases:
+        return True
+    return any(word in owner_dead_words for word in canonical.split())
+
+
 def collect_match_words(session):
-    """Gom mọi cụm hợp lệ của ván (theo thứ tự chơi) vào kho thu thập; trả list cụm của ván."""
+    """Gom cụm CHƯA review của ván (theo thứ tự chơi) vào kho thu thập; trả list cụm của ván."""
     ordered, seen = [], set()
     for item in session.get("game_messages", []):
         phrase = _phrase_from_message(item)
-        if phrase and phrase not in seen:
+        if phrase and phrase not in seen and not _phrase_is_reviewed(phrase):
             seen.add(phrase)
             ordered.append(phrase)
     for phrase in sorted(session.get("used_phrases", set())):
-        if phrase not in seen:
+        if phrase not in seen and not _phrase_is_reviewed(phrase):
             seen.add(phrase)
             ordered.append(phrase)
     changed = False
@@ -4110,7 +4117,11 @@ async def on_message(message):
     # gomtu: gom tất cả cụm bot thu thập (chưa gom lần trước) thành 1 hàng dài.
     if message.author.id == OWNER_ID and re.fullmatch(r"!?gomtu", content.strip(), re.IGNORECASE):
         ensure_word_game_dictionary()  # đảm bảo đã nạp word_stats (sau restore)
-        new_phrases = [p for p in collected_phrases if p not in gomtu_exported]
+        # Bỏ cụm đã review (xác minh/cấm/từ chết) - có thể review sau khi đã thu thập.
+        new_phrases = [
+            p for p in collected_phrases
+            if p not in gomtu_exported and not _phrase_is_reviewed(p)
+        ]
         if not new_phrases:
             await send_reply(message, "chưa có cụm mới nào để gom", remember=False)
             return
@@ -4126,7 +4137,11 @@ async def on_message(message):
     # gheptu: xuất các từ người chơi nói mà bot bí (để thêm từ ghép), trừ từ chết.
     if message.author.id == OWNER_ID and re.fullmatch(r"!?gheptu", content.strip(), re.IGNORECASE):
         ensure_word_game_dictionary()
-        words = [w for w in bot_stuck_words if w not in owner_dead_words]
+        # Bỏ từ chết + từ giờ bot đã có đáp án (đã thêm từ ghép) -> chỉ còn từ thật sự thiếu.
+        words = [
+            w for w in bot_stuck_words
+            if w not in owner_dead_words and not word_game_response_map.get(w)
+        ]
         if not words:
             await send_reply(message, "chưa có từ nào bot bí để ghép", remember=False)
             return
