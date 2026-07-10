@@ -95,6 +95,10 @@ FEEDBACK_EMOJI = "📝"
 DEADWORD_EMOJI = "☠️"
 # Ván NGƯỜI KHÁC chơi: ❌ dưới câu người chơi + câu bot; chủ bot bấm = cấm cụm đó vĩnh viễn.
 DELETE_EMOJI = "❌"
+# ✅ = xác minh cụm là ĐÚNG: lần sau cụm đó chỉ hiện 🔒 (đã xác minh), khỏi kiểm lại.
+VERIFY_EMOJI = "✅"
+# 🔒 = cụm đã xác minh; bấm để BỎ xác minh (sửa lại) nếu thấy có vấn đề.
+VERIFIED_MARK_EMOJI = "🔒"
 FEEDBACK_EXPIRE_SECONDS = 6 * 60 * 60  # tin không xóa nữa nên cho bấm emoji lâu (tới khi bot restart)
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
@@ -711,7 +715,7 @@ def _build_backup_files():
             filename=LEARNED_BACKUP_FILENAME,
         ),
         discord.File(
-            io.BytesIO(json.dumps({"invalid": sorted(owner_invalid_phrases)}, ensure_ascii=False).encode("utf-8")),
+            io.BytesIO(json.dumps(_owner_feedback_payload(), ensure_ascii=False).encode("utf-8")),
             filename=OWNER_FEEDBACK_BACKUP_FILENAME,
         ),
     ]
@@ -842,13 +846,14 @@ async def restore_game_backup_from_dm():
                 except (json.JSONDecodeError, discord.HTTPException) as exc:
                     log.warning("Backup feedback trong DM lỗi: %s", exc)
                     continue
-                if isinstance(raw, dict) and (raw.get("invalid") or raw.get("dead_words")):
+                if isinstance(raw, dict) and (raw.get("invalid") or raw.get("dead_words") or raw.get("verified")):
                     try:
                         with open(OWNER_FEEDBACK_FILE, "w", encoding="utf-8") as handle:
                             json.dump(raw, handle, ensure_ascii=False)
                         log.info(
-                            "Đã khôi phục feedback từ backup DM (%s cụm sai, %s từ chết)",
+                            "Đã khôi phục feedback từ backup DM (%s sai, %s từ chết, %s xác minh)",
                             len(raw.get("invalid") or []), len(raw.get("dead_words") or []),
+                            len(raw.get("verified") or []),
                         )
                     except OSError as exc:
                         log.warning("Không ghi được file feedback: %s", exc)
@@ -1377,6 +1382,7 @@ _external_dict_loaded = False
 word_game_external_phrases = set()  # cụm Viet74K: chỉ dùng CHẤM từ người chơi, bot hạn chế tự nói (nhiều từ hiếm/cổ)
 owner_invalid_phrases = set()       # cụm chủ bot đánh dấu SAI qua emoji feedback, cấm vĩnh viễn
 owner_dead_words = set()            # từ chủ bot đánh dấu TỪ CHẾT qua ☠️: bot dồn tới đây là người chơi thua luôn
+owner_verified_phrases = set()      # cụm chủ bot đã tích ✅ ĐÚNG: lần sau chỉ hiện 🔒, khỏi kiểm lại
 reaction_undo = {}                  # (message_id, emoji) -> hành động đã làm, để gỡ emoji thì hoàn tác
 
 
@@ -1424,8 +1430,16 @@ def _merge_external_dict(path, source_label, mark_external=True):
 learned_words = {}  # {từ_đầu: [từ_sau,...]} bot tự học từ AI, lưu bền qua file + backup
 
 
+def _owner_feedback_payload():
+    return {
+        "invalid": sorted(owner_invalid_phrases),
+        "dead_words": sorted(owner_dead_words),
+        "verified": sorted(owner_verified_phrases),
+    }
+
+
 def load_owner_feedback():
-    global owner_invalid_phrases, owner_dead_words
+    global owner_invalid_phrases, owner_dead_words, owner_verified_phrases
     try:
         with open(OWNER_FEEDBACK_FILE, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -1434,9 +1448,12 @@ def load_owner_feedback():
                 owner_invalid_phrases = {canonical_word_game_text(p) for p in data["invalid"] if isinstance(p, str)}
             if isinstance(data.get("dead_words"), list):
                 owner_dead_words = {canonical_word_game_text(w) for w in data["dead_words"] if isinstance(w, str)}
+            if isinstance(data.get("verified"), list):
+                owner_verified_phrases = {canonical_word_game_text(p) for p in data["verified"] if isinstance(p, str)}
     except (OSError, json.JSONDecodeError):
         owner_invalid_phrases = set()
         owner_dead_words = set()
+        owner_verified_phrases = set()
 
 
 def save_owner_feedback():
@@ -1444,10 +1461,7 @@ def save_owner_feedback():
     try:
         temp = OWNER_FEEDBACK_FILE + ".tmp"
         with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"invalid": sorted(owner_invalid_phrases), "dead_words": sorted(owner_dead_words)},
-                handle, ensure_ascii=False,
-            )
+            json.dump(_owner_feedback_payload(), handle, ensure_ascii=False)
         os.replace(temp, OWNER_FEEDBACK_FILE)
         _game_backup_dirty = True
     except OSError as exc:
@@ -2074,21 +2088,30 @@ async def attach_game_feedback(sent_message, session, kind, phrase):
     if sent_message is None:
         return
     _prune_feedback()
-    if session.get("player_id") == OWNER_ID:
-        # Ván chủ bot: câu BOT nối 📝(sai)+☠️(từ chết); câu CHỦ BOT gõ ☠️(từ chết,
-        # bot học để dùng); tin chấm sai/bí 📝(dạy từ).
+    canonical = canonical_word_game_text(phrase) if phrase else ""
+    is_phrase = kind in ("bot_move", "player_move") and len(canonical.split()) == 2
+    if is_phrase and canonical in owner_verified_phrases:
+        # Cụm đã xác minh: chỉ 🔒 để chủ bot biết khỏi kiểm lại (bấm 🔒 để bỏ xác minh).
+        emojis = [VERIFIED_MARK_EMOJI]
+    elif session.get("player_id") == OWNER_ID:
+        # Ván chủ bot: câu BOT nối 📝(sai)+☠️(từ chết); câu CHỦ BOT gõ ☠️(từ chết, bot học);
+        # tin chấm sai/bí 📝(dạy từ). Câu nối thêm ✅ để xác minh đúng.
         emojis = {
             "bot_move": [FEEDBACK_EMOJI, DEADWORD_EMOJI],
             "player_move": [DEADWORD_EMOJI],
             "teach": [FEEDBACK_EMOJI],
         }.get(kind, [])
+        if is_phrase:
+            emojis = emojis + [VERIFY_EMOJI]
     else:
-        # Ván người khác: câu người chơi & bot ❌(cấm)+☠️(từ chết, bot học); tin bí/thua 📝(dạy).
+        # Ván người khác: câu người chơi & bot ❌(cấm)+☠️(từ chết, bot học)+✅(xác minh); tin bí/thua 📝(dạy).
         emojis = {
             "bot_move": [DELETE_EMOJI, DEADWORD_EMOJI],
             "player_move": [DELETE_EMOJI, DEADWORD_EMOJI],
             "teach": [FEEDBACK_EMOJI],
         }.get(kind, [])
+        if is_phrase:
+            emojis = emojis + [VERIFY_EMOJI]
     if not emojis:
         return
     feedback_targets[sent_message.id] = {
@@ -3734,7 +3757,7 @@ async def on_raw_reaction_add(payload):
     if payload.user_id != OWNER_ID:
         return
     emoji = str(payload.emoji)
-    if emoji not in (FEEDBACK_EMOJI, DEADWORD_EMOJI, DELETE_EMOJI):
+    if emoji not in (FEEDBACK_EMOJI, DEADWORD_EMOJI, DELETE_EMOJI, VERIFY_EMOJI, VERIFIED_MARK_EMOJI):
         return
     kind, phrase = await _resolve_feedback(payload)
     if kind is None:
@@ -3744,7 +3767,26 @@ async def on_raw_reaction_add(payload):
         return
     key = (payload.message_id, emoji)
     try:
-        if emoji == DEADWORD_EMOJI:
+        if emoji == VERIFY_EMOJI:
+            # ✅ xác minh cụm ĐÚNG: lock lại (valid + reusable), lần sau chỉ hiện 🔒.
+            canonical = canonical_word_game_text(phrase)
+            if len(canonical.split()) != 2:
+                return
+            owner_verified_phrases.add(canonical)
+            owner_invalid_phrases.discard(canonical)
+            word_game_validity_cache[canonical] = True
+            learn_word_phrase(canonical)
+            save_owner_feedback()
+            reaction_undo[key] = {"type": "verify", "phrase": canonical}
+            await channel.send(f'ok, "{phrase}" đã xác minh ✅ — lần sau khỏi kiểm lại')
+        elif emoji == VERIFIED_MARK_EMOJI:
+            # 🔒 trên cụm đã xác minh: bỏ xác minh để kiểm/sửa lại.
+            canonical = canonical_word_game_text(phrase)
+            owner_verified_phrases.discard(canonical)
+            save_owner_feedback()
+            reaction_undo[key] = {"type": "unverify", "phrase": canonical}
+            await channel.send(f'ok, bỏ xác minh "{phrase}", lần sau kiểm lại được')
+        elif emoji == DEADWORD_EMOJI:
             canonical = canonical_word_game_text(phrase)
             words = canonical.split()
             if len(words) != 2:
@@ -3791,7 +3833,17 @@ async def on_raw_reaction_remove(payload):
         return
     channel = bot.get_channel(payload.channel_id)
     try:
-        if info["type"] == "invalid":
+        if info["type"] == "verify":
+            owner_verified_phrases.discard(info["phrase"])
+            save_owner_feedback()
+            if channel:
+                await channel.send(f'ok gỡ xác minh "{info["phrase"]}"')
+        elif info["type"] == "unverify":
+            owner_verified_phrases.add(info["phrase"])
+            save_owner_feedback()
+            if channel:
+                await channel.send(f'ok, xác minh lại "{info["phrase"]}"')
+        elif info["type"] == "invalid":
             unflag_phrase_invalid(info["phrase"])
             if channel:
                 await channel.send(f'ok gỡ, "{info["phrase"]}" dùng lại được')
