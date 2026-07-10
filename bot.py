@@ -1780,6 +1780,22 @@ def is_tone_reduplication(phrase):
     return normalize_word_game_text(words[0]) == normalize_word_game_text(words[1])
 
 
+def is_dead_end_exploit(phrase):
+    """Người chơi ghép 'X + từ cụt' (làng ngợm, truyện ngợm) để ép bot bí.
+
+    Cụm THẬT (trong từ điển hoặc chủ bot đã xác minh) thì tha; còn cụm bịa mà chữ cuối
+    là từ không có đường nối nào trong từ điển -> chỉ để dồn bot vào chỗ chết -> chặn.
+    """
+    ensure_word_game_dictionary()
+    canonical = canonical_word_game_text(phrase)
+    words = canonical.split()
+    if len(words) != 2:
+        return False
+    if canonical in word_game_dictionary_phrases or canonical in owner_verified_phrases:
+        return False
+    return not word_game_response_map.get(words[1])
+
+
 # Cấu trúc âm tiết tiếng Việt: (phụ âm đầu) + vần (nguyên âm + phụ âm cuối tùy chọn).
 _VN_VOWELS = set("aàáảãạăằắẳẵặâầấẩẫậeèéẻẽẹêềếểễệiìíỉĩịoòóỏõọôồốổỗộơờớởỡợuùúủũụưừứửữựyỳýỷỹỵ")
 _VN_CONS = set("bcdđghklmnpqrstvx")
@@ -2507,6 +2523,14 @@ async def handle_word_game_session(message, prompt, session):
     if reverses_used_phrase(phrase_key, session["used_phrases"]):
         await register_word_game_strike(
             message, session, phrase_key, reason="cấm đảo ngược cụm đã dùng nha, đổi cụm khác",
+        )
+        return
+    # Chống bug: người chơi ghép bừa từ + TỪ CỤT (làng ngợm, truyện ngợm) để ép bot bí.
+    # Cụm kết ở từ không có đường nối mà KHÔNG phải cụm thật (trong từ điển/đã xác minh) -> chặn.
+    if is_dead_end_exploit(phrase_key):
+        await register_word_game_strike(
+            message, session, phrase_key,
+            reason=f'"{phrase_key}" không phải cụm có thật, đừng ghép bừa với từ cụt',
         )
         return
     if await judge_word_game_phrase(phrase_key, source="người chơi") is False:
