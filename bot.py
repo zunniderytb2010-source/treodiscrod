@@ -471,6 +471,7 @@ word_game_dead_ends = None                        # normalized dead-end words
 word_game_start_pool = None                       # easy starts, built lazily
 word_game_validity_cache = {}                     # canonical phrase -> bool semantic verdict
 word_game_dictionary_phrases = set()              # all phrases already present in static data
+word_game_known_words = set()                     # mọi TỪ có thật trong kho (curated + Viet74K + học): chống từ bịa
 unknown_word_phrases = {}                         # missing phrase -> source/verdict/count
 _game_backup_dirty = False                        # data đổi từ lần backup DM gần nhất
 
@@ -1724,11 +1725,13 @@ def learn_word_phrase(canonical):
         word_game_response_map.setdefault(key, []).append(canonical)
     if word_game_dictionary_phrases is not None:
         word_game_dictionary_phrases.add(canonical)
+    word_game_known_words.update((key, second))  # từ AI xác nhận -> coi là có thật từ giờ
     save_learned_words()
 
 
 def ensure_word_game_dictionary():
     global word_game_response_map, word_game_dead_ends, word_game_start_pool, word_game_dictionary_phrases
+    global word_game_known_words
     if word_game_response_map is not None:
         return
     load_external_dictionaries()
@@ -1752,6 +1755,11 @@ def ensure_word_game_dictionary():
         for phrase in phrases
         if not phrase_has_forbidden(phrase)
     )
+    # Kho TỪ có thật: mọi tiếng xuất hiện trong từ điển (curated + Viet74K + học). Dùng để
+    # chặn từ BỊA/vô nghĩa kiểu "mìm mùm" (đúng cấu trúc TV nhưng không có trong kho nào).
+    word_game_known_words = set(word_game_response_map.keys())
+    for phrase in word_game_dictionary_phrases:
+        word_game_known_words.update(phrase.split())
     word_game_dead_ends = {canonical_word_game_text(word) for word in DEAD_END_WORDS}
     word_game_start_pool = []
     for phrase in FAIR_WORD_GAME_STARTS:
@@ -1785,6 +1793,19 @@ def phrase_has_forbidden(phrase):
         word in WORD_GAME_FORBIDDEN_WORDS
         for word in canonical_word_game_text(phrase).split()
     )
+
+
+def phrase_has_unknown_word(phrase):
+    """Cụm chứa TỪ không có trong kho từ có thật (khả năng bịa: 'mìm mùm').
+
+    Cụm đã trong từ điển / chủ bot xác minh thì tha; còn lại nếu có tiếng lạ hoắc
+    (không xuất hiện ở đâu trong 44k+ cụm) thì bắt AI kiểm gắt trước khi cho qua.
+    """
+    ensure_word_game_dictionary()
+    canonical = canonical_word_game_text(phrase)
+    if canonical in word_game_dictionary_phrases or canonical in owner_verified_phrases:
+        return False
+    return any(word not in word_game_known_words for word in canonical.split())
 
 
 def reverses_used_phrase(phrase, used_phrases):
@@ -1987,8 +2008,13 @@ def _parse_word_game_verdict(text):
     return None
 
 
-async def judge_word_game_phrase(phrase, source="không rõ"):
-    """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau."""
+async def judge_word_game_phrase(phrase, source="không rõ", strict=False):
+    """Kiểm tra nghĩa bằng AI cho cụm lạ; cache để không tốn token ở lần sau.
+
+    strict=True dùng cho cụm chứa TỪ BỊA (không có trong kho từ có thật): lúc này chỉ
+    chấp nhận khi AI KHẲNG ĐỊNH hợp lệ, còn mơ hồ/AI hỏng thì CHẶN — để cụm vô nghĩa
+    kiểu "mìm mùm" không lọt qua nhờ AI dễ dãi.
+    """
     ensure_word_game_dictionary()
     canonical = canonical_word_game_text(phrase)
     # Nối từ chỉ tiếng Việt: có từ tiếng Anh là loại luôn.
@@ -2040,10 +2066,23 @@ async def judge_word_game_phrase(phrase, source="không rõ"):
     except Exception as exc:
         # AI hỏng/hết key: KHÔNG xử oan người chơi (mất tiền thật). Cho qua, chỉ chặn được
         # garbage rõ ràng ở bộ lọc cứng phía trên (ALWAYS_INVALID, lặp từ, tục).
+        # Ngoại lệ: cụm chứa TỪ BỊA (strict) thì AI hỏng vẫn CHẶN, vì tự nó đã rất khả nghi.
+        if strict:
+            word_game_validity_cache[canonical] = False
+            record_unknown_word_phrase(canonical, source, False)
+            return False
         log.warning("AI kiểm nghĩa nối từ lỗi (%s), cho qua", type(exc).__name__)
         record_unknown_word_phrase(canonical, source)
         return True
     parsed = _parse_word_game_verdict(verdict)
+    if strict:
+        # Từ không có trong kho: chỉ qua khi AI KHẲNG ĐỊNH VALID, mơ hồ/INVALID đều chặn.
+        valid = parsed is True
+        word_game_validity_cache[canonical] = valid
+        record_unknown_word_phrase(canonical, source, valid)
+        if valid:
+            learn_word_phrase(canonical)
+        return valid
     if parsed is True:
         valid = True
     elif parsed is False:
@@ -2563,8 +2602,13 @@ async def handle_word_game_session(message, prompt, session):
             reason=f'"{phrase_key}" không phải cụm có thật, đừng ghép bừa với từ cụt',
         )
         return
-    if await judge_word_game_phrase(phrase_key, source="người chơi") is False:
-        await register_word_game_strike(message, session, phrase_key)
+    # Từ bịa/vô nghĩa (có tiếng không tồn tại trong kho) -> AI phải xác nhận gắt, mơ hồ là chặn.
+    strict = phrase_has_unknown_word(phrase_key)
+    if await judge_word_game_phrase(phrase_key, source="người chơi", strict=strict) is False:
+        await register_word_game_strike(
+            message, session, phrase_key,
+            reason=("cụm này vô nghĩa/từ bịa, chơi từ có thật đi" if strict else None),
+        )
         return
 
     session["used_phrases"].add(phrase_key)
