@@ -95,8 +95,7 @@ FEEDBACK_EMOJI = "📝"
 DEADWORD_EMOJI = "☠️"
 # Ván NGƯỜI KHÁC chơi: ❌ dưới câu người chơi + câu bot; chủ bot bấm = cấm cụm đó vĩnh viễn.
 DELETE_EMOJI = "❌"
-FEEDBACK_EXPIRE_SECONDS = 10 * 60
-OWNER_CLEANUP_DELAY_SECONDS = 120  # ván của chủ bot giữ tin lâu hơn để kịp feedback
+FEEDBACK_EXPIRE_SECONDS = 6 * 60 * 60  # tin không xóa nữa nên cho bấm emoji lâu (tới khi bot restart)
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_START_BALANCE = 10_000
@@ -1968,17 +1967,11 @@ def build_word_game_transcript(session, won):
 
 
 async def archive_and_cleanup_word_game(session, source_channel, won):
-    """Gửi biên bản trước; chỉ dọn tin khi bản lưu đã lên kênh thành công."""
+    """Gửi biên bản ván vào kênh lưu; GIỮ NGUYÊN tin nhắn trong kênh (không xóa) để
+    chủ bot còn bấm emoji chấm/cấm cụm sau ván."""
     log_channel = find_word_game_log_channel(source_channel)
     if log_channel is None:
-        log.warning(
-            "Không tìm thấy kênh lưu nối từ %r trong guild %s; giữ nguyên tin nhắn ván %s",
-            WORD_GAME_LOG_CHANNEL_NAME,
-            getattr(getattr(source_channel, "guild", None), "id", None),
-            session.get("game_id"),
-        )
         return False
-
     player_id = session.get("player_id")
     game_id = session.get("game_id")
     filename = f"{player_id}_{game_id}.txt"
@@ -1993,19 +1986,6 @@ async def archive_and_cleanup_word_game(session, source_channel, won):
     except discord.HTTPException as exc:
         log.warning("Không gửi được biên bản nối từ %s: %s", game_id, exc)
         return False
-
-    # Xóa từ mới tới cũ để reply không còn treo vào tin đã bị xóa.
-    failed = 0
-    for item in reversed(session.get("game_messages", [])):
-        try:
-            await item.delete()
-        except discord.NotFound:
-            pass
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            failed += 1
-            log.warning("Không xóa được tin %s của ván %s: %s", item.id, game_id, exc)
-    if failed:
-        log.warning("Ván %s còn %s tin không xóa được; kiểm tra quyền Manage Messages", game_id, failed)
     return True
 
 
@@ -2066,12 +2046,9 @@ async def word_game_turn_countdown(key, session, turn_id, bot_message, seconds=W
                 allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
             )
             record_word_game_message(session, sent)
-            # Chủ bot: gắn feedback + giữ tin lâu hơn để kịp ý kiến vụ hết giờ.
+            # Chủ bot: gắn feedback để kịp ý kiến vụ hết giờ.
             await attach_game_feedback(sent, session, "teach", session.get("last_word", ""))
-            if session.get("player_id") == OWNER_ID:
-                asyncio.create_task(_archive_after_feedback(session, bot_message.channel, False))
-            else:
-                await archive_and_cleanup_word_game(session, bot_message.channel, won=False)
+            await archive_and_cleanup_word_game(session, bot_message.channel, won=False)
     except asyncio.CancelledError:
         raise
     except discord.HTTPException as exc:
@@ -2154,24 +2131,9 @@ async def register_word_game_strike(message, session, phrase_key, profane=False,
     start_word_game_timer((message.channel.id, message.author.id), session, sent)
 
 
-async def _archive_after_feedback(session, channel, won):
-    """Ván chủ bot: giữ tin lâu hơn để kịp bấm 📝/dạy từ; dạy dở thì chờ thêm rồi mới dọn."""
-    await asyncio.sleep(OWNER_CLEANUP_DELAY_SECONDS)
-    for _ in range(18):  # tối đa chờ thêm 3 phút nếu đang dở phiên dạy từ
-        _prune_feedback()
-        if not pending_teach:
-            break
-        await asyncio.sleep(10)
-    for item in session.get("game_messages", []):
-        feedback_targets.pop(getattr(item, "id", 0), None)
-    await archive_and_cleanup_word_game(session, channel, won)
-
-
 async def _finish_cleanup(message, session, won):
-    if session.get("player_id") == OWNER_ID:
-        asyncio.create_task(_archive_after_feedback(session, message.channel, won))
-    else:
-        await archive_and_cleanup_word_game(session, message.channel, won)
+    # Không xóa tin nữa: chỉ lưu biên bản, giữ nguyên tin trong kênh để còn bấm emoji.
+    await archive_and_cleanup_word_game(session, message.channel, won)
 
 
 async def finish_word_game_win(message, session):
