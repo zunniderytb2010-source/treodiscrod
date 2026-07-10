@@ -1749,12 +1749,41 @@ def is_tone_reduplication(phrase):
     return normalize_word_game_text(words[0]) == normalize_word_game_text(words[1])
 
 
+# Cấu trúc âm tiết tiếng Việt: (phụ âm đầu) + vần (nguyên âm + phụ âm cuối tùy chọn).
+_VN_VOWELS = set("aàáảãạăằắẳẵặâầấẩẫậeèéẻẽẹêềếểễệiìíỉĩịoòóỏõọôồốổỗộơờớởỡợuùúủũụưừứửữựyỳýỷỹỵ")
+_VN_CONS = set("bcdđghklmnpqrstvx")
+_VN_INITIALS = ["ngh", "tr", "th", "ph", "nh", "ng", "kh", "gi", "gh", "ch", "qu",
+                "b", "c", "d", "đ", "g", "h", "k", "l", "m", "n", "p", "q", "r", "s", "t", "v", "x"]
+_VN_FINALS = ["ng", "nh", "ch", "c", "m", "n", "p", "t"]
+
+
+def is_vietnamese_syllable(word):
+    """Từ có phải 1 âm tiết tiếng Việt hợp lệ không (dùng để loại tiếng Anh: comment, using...)."""
+    word = (word or "").lower()
+    if not word or len(word) > 7 or not all(ch in _VN_VOWELS or ch in _VN_CONS for ch in word):
+        return False
+    rest = word
+    for ini in _VN_INITIALS:
+        if rest.startswith(ini):
+            rest = rest[len(ini):]
+            break
+    if not rest or rest[0] not in _VN_VOWELS:
+        return False
+    for fin in _VN_FINALS:
+        if rest.endswith(fin) and len(rest) > len(fin):
+            rest = rest[:-len(fin)]
+            break
+    return len(rest) >= 1 and all(ch in _VN_VOWELS for ch in rest)
+
+
 def word_is_foreign(word):
-    """Từ tiếng Anh/ngoại lai: có f/j/w/z (không có trong tiếng Việt) hoặc trong danh sách English."""
+    """Từ ngoại lai: có f/j/w/z, trong danh sách English, HOẶC không phải âm tiết tiếng Việt hợp lệ."""
     word = (word or "").lower()
     if word in WORD_GAME_ENGLISH_WORDS:
         return True
-    return any(ch in normalize_word_game_text(word) for ch in "fjwz")
+    if any(ch in normalize_word_game_text(word) for ch in "fjwz"):
+        return True
+    return not is_vietnamese_syllable(word)
 
 
 def phrase_has_foreign(phrase):

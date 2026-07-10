@@ -12731,3 +12731,34 @@ for _k in list(RESPONSE_MAP):
 RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
 DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if not _is_foreign(_w)}
 START_PHRASES = [_p for _p in START_PHRASES if not _phrase_has_foreign(_p)]
+
+# ==================== DON NON-VIETNAMESE (2026-07-10) ====================
+# Loai moi cum co am tiet KHONG phai tieng Viet (comment, using, admin, chill...).
+import unicodedata as _ud2
+_VNV = set("aàáảãạăằắẳẵặâầấẩẫậeèéẻẽẹêềếểễệiìíỉĩịoòóỏõọôồốổỗộơờớởỡợuùúủũụưừứửữựyỳýỷỹỵ")
+_VNC = set("bcdđghklmnpqrstvx")
+_VNI = ["ngh","tr","th","ph","nh","ng","kh","gi","gh","ch","qu","b","c","d","đ","g","h","k","l","m","n","p","q","r","s","t","v","x"]
+_VNF = ["ng","nh","ch","c","m","n","p","t"]
+def _vn_syl(_w):
+    _w = (_w or "").lower()
+    if not _w or len(_w) > 7 or not all(_c in _VNV or _c in _VNC for _c in _w):
+        return False
+    _r = _w
+    for _i in _VNI:
+        if _r.startswith(_i):
+            _r = _r[len(_i):]; break
+    if not _r or _r[0] not in _VNV:
+        return False
+    for _f in _VNF:
+        if _r.endswith(_f) and len(_r) > len(_f):
+            _r = _r[:-len(_f)]; break
+    return len(_r) >= 1 and all(_c in _VNV for _c in _r)
+def _phrase_vn(_p):
+    return all(_vn_syl(_x) for _x in _p.split())
+for _k in list(RESPONSE_MAP):
+    if not _vn_syl(_k):
+        del RESPONSE_MAP[_k]; continue
+    RESPONSE_MAP[_k] = [_p for _p in RESPONSE_MAP[_k] if _phrase_vn(_p)]
+RESPONSE_MAP = {_k: _v for _k, _v in RESPONSE_MAP.items() if _v}
+START_PHRASES = [_p for _p in START_PHRASES if _phrase_vn(_p)]
+DEAD_END_WORDS = {_w for _w in DEAD_END_WORDS if _vn_syl(_w)}
