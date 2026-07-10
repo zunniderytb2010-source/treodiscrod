@@ -1384,6 +1384,7 @@ owner_invalid_phrases = set()       # cụm chủ bot đánh dấu SAI qua emoji
 owner_dead_words = set()            # từ chủ bot đánh dấu TỪ CHẾT qua ☠️: bot dồn tới đây là người chơi thua luôn
 owner_verified_phrases = set()      # cụm chủ bot đã tích ✅ ĐÚNG: lần sau chỉ hiện 🔒, khỏi kiểm lại
 reaction_undo = {}                  # (message_id, emoji) -> hành động đã làm, để gỡ emoji thì hoàn tác
+ghitu_sessions = {}                 # owner_id -> phiên nhập hàng loạt !ghitu (invalid -> dead -> valid)
 
 
 def _merge_external_dict(path, source_label, mark_external=True):
@@ -3898,6 +3899,87 @@ async def on_ready():
         asyncio.create_task(game_backup_loop())
 
 
+GHITU_EXPIRE_SECONDS = 15 * 60
+_GHITU_SKIP = {"xong", "skip", "bỏ qua", "bo qua", "-", "done", ""}
+_GHITU_CANCEL = {"huy", "hủy", "cancel", "dừng", "dung", "stop", "thôi", "thoi"}
+
+
+def _process_ghitu_lines(step, content):
+    """Xử lý từng dòng theo bước: invalid (cấm cụm), dead (từ chết), valid (xác minh)."""
+    added = 0
+    for raw in (content or "").splitlines():
+        line = raw.strip().strip("*").strip()
+        if not line:
+            continue
+        canonical = canonical_word_game_text(line)
+        words = canonical.split()
+        if step == "dead":
+            # Mỗi dòng: 1 từ chết, hoặc cụm 2 từ thì lấy chữ cuối.
+            word = words[-1] if words else ""
+            if word and not word_is_foreign(word) and word not in WORD_GAME_BANNED_WORDS:
+                owner_dead_words.add(word)
+                added += 1
+            continue
+        # invalid/valid cần cụm 2 từ tiếng Việt sạch.
+        if (
+            len(words) != 2 or words[0] == words[1]
+            or phrase_has_foreign(canonical)
+            or any(w in WORD_GAME_BANNED_WORDS for w in words)
+        ):
+            continue
+        if step == "invalid":
+            flag_phrase_invalid(canonical)
+            added += 1
+        elif step == "valid":
+            owner_verified_phrases.add(canonical)
+            owner_invalid_phrases.discard(canonical)
+            word_game_validity_cache[canonical] = True
+            learn_word_phrase(canonical)
+            added += 1
+    save_owner_feedback()
+    return added
+
+
+async def _handle_ghitu_step(message, content):
+    sess = ghitu_sessions.get(OWNER_ID)
+    if not sess:
+        return
+    step = sess["step"]
+    if content.strip().lower() in _GHITU_CANCEL:
+        ghitu_sessions.pop(OWNER_ID, None)
+        await send_reply(message, "ok huỷ ghi từ", remember=False)
+        return
+    n = 0 if content.strip().lower() in _GHITU_SKIP else _process_ghitu_lines(step, content)
+    sess["counts"][step] = n
+    sess["expires"] = time.time() + GHITU_EXPIRE_SECONDS
+    if step == "invalid":
+        sess["step"] = "dead"
+        await send_reply(
+            message,
+            f"Đã xác minh ✅ {n} cụm KHÔNG HỢP LỆ.\n"
+            "giờ ghi các TỪ CHẾT, mỗi từ 1 dòng (bỏ qua thì gõ `xong`)",
+            remember=False,
+        )
+    elif step == "dead":
+        sess["step"] = "valid"
+        await send_reply(
+            message,
+            f"Đã xác minh ✅ {n} TỪ CHẾT.\n"
+            "giờ ghi các cụm HỢP LỆ, mỗi cụm 1 dòng (bỏ qua thì gõ `xong`)",
+            remember=False,
+        )
+    else:
+        counts = sess["counts"]
+        ghitu_sessions.pop(OWNER_ID, None)
+        await send_reply(
+            message,
+            f"Đã xác minh ✅ {n} cụm HỢP LỆ.\n"
+            f"xong hết: {counts.get('invalid', 0)} không hợp lệ · "
+            f"{counts.get('dead', 0)} từ chết · {n} hợp lệ",
+            remember=False,
+        )
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -3910,6 +3992,34 @@ async def on_message(message):
     lowered = content.lower()
     key = (message.channel.id, message.author.id)
     has_game_session = key in word_game_sessions
+
+    # Lệnh !ghitu (chỉ chủ bot): mở wizard nhập hàng loạt invalid -> dead -> valid.
+    if message.author.id == OWNER_ID and content.strip().lower() == "!ghitu":
+        ghitu_sessions[OWNER_ID] = {
+            "step": "invalid",
+            "channel_id": message.channel.id,
+            "expires": time.time() + GHITU_EXPIRE_SECONDS,
+            "counts": {},
+        }
+        await send_reply(
+            message,
+            "ghi các cụm KHÔNG HỢP LỆ, mỗi cụm 1 dòng (dán 1 tin nhiều dòng cũng được).\n"
+            "bỏ qua bước này thì gõ `xong`, huỷ thì gõ `huỷ`",
+            remember=False,
+        )
+        return
+    # Đang trong wizard !ghitu: bắt nội dung theo từng bước.
+    ghitu = ghitu_sessions.get(OWNER_ID)
+    if (
+        message.author.id == OWNER_ID and ghitu
+        and ghitu["channel_id"] == message.channel.id
+    ):
+        if time.time() >= ghitu["expires"]:
+            ghitu_sessions.pop(OWNER_ID, None)
+        else:
+            await _handle_ghitu_step(message, content)
+            return
+
     if not has_game_session:
         remember_channel_message(message.channel.id, message.author.display_name, content)
 
