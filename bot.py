@@ -90,6 +90,9 @@ MAINTENANCE_RESTORE_DELAY_SECONDS = 20
 # Emoji feedback nối từ, chỉ chủ bot: bấm trên câu bot nối = từ đó sai;
 # bấm trên câu chấm sai/bí từ = muốn dạy từ đúng.
 FEEDBACK_EMOJI = "📝"
+# Bấm ☠️ trên câu bot nối = CHỮ CUỐI của cụm đó là TỪ CHẾT (không có đường nối):
+# từ đó về sau, ván nào bot dồn người chơi tới từ này là người chơi thua luôn.
+DEADWORD_EMOJI = "☠️"
 FEEDBACK_EXPIRE_SECONDS = 10 * 60
 OWNER_CLEANUP_DELAY_SECONDS = 120  # ván của chủ bot giữ tin lâu hơn để kịp feedback
 WORD_GAME_MAX_STRIKES = 4
@@ -838,11 +841,14 @@ async def restore_game_backup_from_dm():
                 except (json.JSONDecodeError, discord.HTTPException) as exc:
                     log.warning("Backup feedback trong DM lỗi: %s", exc)
                     continue
-                if isinstance(raw, dict) and raw.get("invalid"):
+                if isinstance(raw, dict) and (raw.get("invalid") or raw.get("dead_words")):
                     try:
                         with open(OWNER_FEEDBACK_FILE, "w", encoding="utf-8") as handle:
                             json.dump(raw, handle, ensure_ascii=False)
-                        log.info("Đã khôi phục %s cụm feedback từ backup DM", len(raw["invalid"]))
+                        log.info(
+                            "Đã khôi phục feedback từ backup DM (%s cụm sai, %s từ chết)",
+                            len(raw.get("invalid") or []), len(raw.get("dead_words") or []),
+                        )
                     except OSError as exc:
                         log.warning("Không ghi được file feedback: %s", exc)
     except discord.HTTPException as exc:
@@ -1369,6 +1375,7 @@ _external_dict_loaded = False
 
 word_game_external_phrases = set()  # cụm Viet74K: chỉ dùng CHẤM từ người chơi, bot hạn chế tự nói (nhiều từ hiếm/cổ)
 owner_invalid_phrases = set()       # cụm chủ bot đánh dấu SAI qua emoji feedback, cấm vĩnh viễn
+owner_dead_words = set()            # từ chủ bot đánh dấu TỪ CHẾT qua ☠️: bot dồn tới đây là người chơi thua luôn
 
 
 def _merge_external_dict(path, source_label, mark_external=True):
@@ -1416,14 +1423,18 @@ learned_words = {}  # {từ_đầu: [từ_sau,...]} bot tự học từ AI, lưu
 
 
 def load_owner_feedback():
-    global owner_invalid_phrases
+    global owner_invalid_phrases, owner_dead_words
     try:
         with open(OWNER_FEEDBACK_FILE, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        if isinstance(data, dict) and isinstance(data.get("invalid"), list):
-            owner_invalid_phrases = {canonical_word_game_text(p) for p in data["invalid"] if isinstance(p, str)}
+        if isinstance(data, dict):
+            if isinstance(data.get("invalid"), list):
+                owner_invalid_phrases = {canonical_word_game_text(p) for p in data["invalid"] if isinstance(p, str)}
+            if isinstance(data.get("dead_words"), list):
+                owner_dead_words = {canonical_word_game_text(w) for w in data["dead_words"] if isinstance(w, str)}
     except (OSError, json.JSONDecodeError):
         owner_invalid_phrases = set()
+        owner_dead_words = set()
 
 
 def save_owner_feedback():
@@ -1431,7 +1442,10 @@ def save_owner_feedback():
     try:
         temp = OWNER_FEEDBACK_FILE + ".tmp"
         with open(temp, "w", encoding="utf-8") as handle:
-            json.dump({"invalid": sorted(owner_invalid_phrases)}, handle, ensure_ascii=False)
+            json.dump(
+                {"invalid": sorted(owner_invalid_phrases), "dead_words": sorted(owner_dead_words)},
+                handle, ensure_ascii=False,
+            )
         os.replace(temp, OWNER_FEEDBACK_FILE)
         _game_backup_dirty = True
     except OSError as exc:
@@ -1642,8 +1656,8 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
     # Nước gài chết (từ cuối tuyệt đường) coi như âm để ưu tiên tuyệt đối. Càng thấp càng bóp.
     def hardness(item):
         end = item[2]
-        if end in WORD_GAME_KILL_WORDS:
-            return -1
+        if end in WORD_GAME_KILL_WORDS or end in owner_dead_words:
+            return -1  # từ chết chủ bot đánh dấu = nước ăn ngay, ưu tiên tuyệt đối
         base = _player_continuation_count(end, used_phrases | {item[1]})
         # Từ cuối cụt/hiếm khó cho người chơi hơn -> ưu tiên nhẹ.
         if end in word_game_dead_ends:
@@ -2033,7 +2047,7 @@ def _prune_feedback():
 
 
 async def attach_owner_feedback(sent_message, session, kind, phrase):
-    """Ván của chủ bot: gắn emoji 📝 để chấm/dạy từ ngay trong game."""
+    """Ván của chủ bot: gắn emoji 📝 để chấm/dạy từ; câu bot nối thêm ☠️ đánh dấu từ chết."""
     if session.get("player_id") != OWNER_ID or sent_message is None:
         return
     _prune_feedback()
@@ -2044,6 +2058,8 @@ async def attach_owner_feedback(sent_message, session, kind, phrase):
     }
     try:
         await sent_message.add_reaction(FEEDBACK_EMOJI)
+        if kind == "bot_move":
+            await sent_message.add_reaction(DEADWORD_EMOJI)
     except discord.HTTPException:
         pass
 
@@ -2271,6 +2287,15 @@ async def handle_word_game_session(message, prompt, session):
     session["current_phrase"] = response
     session["last_word"] = response_words[-1]
     session["updated_at"] = time.time()
+
+    # Bot dồn được người chơi tới TỪ CHẾT (chủ bot đánh dấu ☠️): thua luôn, khỏi đếm giờ.
+    if response_words[-1] in owner_dead_words:
+        await finish_word_game_loss(
+            message,
+            session,
+            f't nối: **{response}**\n"{response_words[-1]}" là từ chết ☠️ hết đường nối',
+        )
+        return
 
     sent = await send_word_game_reply(
         message,
@@ -3008,6 +3033,15 @@ _META_NARRATE_RE = re.compile(
 )
 
 
+# Từ chức năng tiếng Anh hay xuất hiện trong câu reasoning; Zun không bao giờ chat kiểu này.
+_EN_META_WORDS_RE = re.compile(
+    r"\b(the|is|are|was|were|has|have|can|could|should|would|will|since|given"
+    r"|just|said|says|user|response|variation|repeat|pattern|comeback|option"
+    r"|established|final|good|slight)\b",
+    re.IGNORECASE,
+)
+
+
 def looks_like_meta(text):
     """Câu trả lời có phải là suy nghĩ/kể chuyện (không phải lời Zun chat) không."""
     t = (text or "").strip()
@@ -3017,6 +3051,10 @@ def looks_like_meta(text):
         return True
     # Nhắc tới "persona" gần như luôn là meta phân tích, không phải lời chat.
     if re.search(r"\bpersona\b", t, re.IGNORECASE):
+        return True
+    # Câu dài nhiều từ chức năng tiếng Anh (Given the pattern..., Since the user...):
+    # Zun chỉ chat tiếng Việt nên đây chắc chắn là reasoning bị lộ.
+    if len(t) > 60 and len(_EN_META_WORDS_RE.findall(t)) >= 4:
         return True
     # Câu kể chuyện ngôi thứ 3 về chính Zun/User (dài dòng phân tích).
     return bool(_META_NARRATE_RE.match(t) and len(t) > 40)
@@ -3632,25 +3670,44 @@ _backup_started = False
 
 @bot.event
 async def on_raw_reaction_add(payload):
-    """Emoji feedback nối từ: chỉ chủ bot, chỉ emoji 📝, chỉ tin đã đăng ký."""
-    if payload.user_id != OWNER_ID or str(payload.emoji) != FEEDBACK_EMOJI:
+    """Emoji feedback nối từ: chỉ chủ bot, 📝 (sai/dạy từ) hoặc ☠️ (từ chết)."""
+    if payload.user_id != OWNER_ID:
+        return
+    emoji = str(payload.emoji)
+    if emoji not in (FEEDBACK_EMOJI, DEADWORD_EMOJI):
         return
     _prune_feedback()
-    target = feedback_targets.pop(payload.message_id, None)
+    target = feedback_targets.get(payload.message_id)
     if target is None:
         return
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
         return
     try:
-        if target["kind"] == "bot_move":
-            # Chủ bot bảo từ bot nối SAI: gạch vĩnh viễn khỏi mọi kho từ.
+        if emoji == DEADWORD_EMOJI:
+            # ☠️ chỉ có nghĩa trên câu bot nối: chữ cuối cụm đó là TỪ CHẾT.
+            if target["kind"] != "bot_move":
+                return
+            words = canonical_word_game_text(target["phrase"]).split()
+            if not words:
+                return
+            feedback_targets.pop(payload.message_id, None)
+            dead = words[-1]
+            owner_dead_words.add(dead)
+            save_owner_feedback()
+            await channel.send(
+                f'ok, "{dead}" là từ chết ☠️ — từ giờ ván nào bị dồn tới "{dead}" là thua luôn'
+            )
+        elif target["kind"] == "bot_move":
+            # 📝 trên câu bot nối: từ bot nối SAI, gạch vĩnh viễn khỏi mọi kho từ.
+            feedback_targets.pop(payload.message_id, None)
             flag_phrase_invalid(target["phrase"])
             await channel.send(
                 f'ok, t gạch "{target["phrase"]}" khỏi từ điển, không dùng lại nữa'
             )
         else:
-            # Bot chấm sai/bí từ: mở phiên dạy, chủ bot reply cụm đúng để bot học.
+            # 📝 trên tin chấm sai/bí từ: mở phiên dạy, chủ bot reply cụm đúng để bot học.
+            feedback_targets.pop(payload.message_id, None)
             prompt = await channel.send(
                 "từ đúng là gì? reply tin này với đúng cụm 2 từ, t học luôn"
             )
