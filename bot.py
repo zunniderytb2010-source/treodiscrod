@@ -107,6 +107,7 @@ FEEDBACK_EXPIRE_SECONDS = 6 * 60 * 60  # tin không xóa nữa nên cho bấm em
 WORD_GAME_MAX_STRIKES = 4
 # 0️⃣ 1️⃣ ... 9️⃣ 🔟, index = số giây còn lại
 WORD_GAME_START_BALANCE = 10_000
+WORD_GAME_MAX_BET = 250_000  # tối đa mỗi ván đặt được
 WORD_GAME_MAX_AI_USED = 80
 # Kinh tế: điểm danh hằng ngày, vay tiền, nợ đỏ.
 DAILY_REWARD_BASE = 5_000
@@ -2432,11 +2433,12 @@ async def handle_word_game_session(message, prompt, session):
     profile = game_profile_for(message.author)
     if session["state"] == "waiting_bet":
         bet = parse_word_game_bet(prompt)
-        if bet is None or bet > profile["balance"]:
+        cap = min(profile["balance"], WORD_GAME_MAX_BET)
+        if bet is None or bet > cap:
             await send_word_game_reply(
                 message,
                 session,
-                f"tiền cược phải từ 1đ tới {profile['balance']:,}đ",
+                f"tiền cược phải từ 1đ tới {cap:,}đ (tối đa {WORD_GAME_MAX_BET:,}đ/ván)",
             )
             return
         profile["balance"] -= bet
@@ -4186,6 +4188,20 @@ async def on_message(message):
     lowered = content.lower()
     key = (message.channel.id, message.author.id)
     has_game_session = key in word_game_sessions
+
+    # resettien: reset toàn bộ số dư người chơi về 10k, xoá nợ (chỉ chủ bot).
+    if message.author.id == OWNER_ID and re.fullmatch(r"!?resettien", content.strip(), re.IGNORECASE):
+        async with balance_lock:
+            for profile in game_profiles.values():
+                profile["balance"] = WORD_GAME_START_BALANCE
+                profile["debt"] = 0
+            save_game_data()
+        await send_reply(
+            message,
+            f"đã reset {len(game_profiles)} tài khoản về {WORD_GAME_START_BALANCE:,}đ, xoá sạch nợ",
+            remember=False,
+        )
+        return
 
     # gomtu: gom tất cả cụm bot thu thập (chưa gom lần trước) thành 1 hàng dài.
     if message.author.id == OWNER_ID and re.fullmatch(r"!?gomtu", content.strip(), re.IGNORECASE):
