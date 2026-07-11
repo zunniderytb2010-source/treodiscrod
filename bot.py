@@ -1918,6 +1918,21 @@ def choose_dictionary_word_response(last_word, used_phrases, used_required_words
     if not candidates:
         return None
 
+    # SIÊU KHÓ: nếu có nước GÀI CHẾT (kết ở từ đối thủ hết đường nối) thì chốt luôn,
+    # KỂ CẢ cụm hiếm/Viet74K. Trước đây bot bỏ lỡ 'người ngợm' vì ưu tiên cụm quen ->
+    # giờ nước thắng luôn được ưu tiên tuyệt đối, bỏ qua mọi bộ lọc quen/né.
+    def is_kill_move(item):
+        end = item[2]
+        if end in WORD_GAME_KILL_WORDS or end in owner_dead_words or end in word_game_dead_ends:
+            return True  # từ chết chắc chắn -> đối thủ tắc luôn
+        # Hết sạch đường nối trong từ điển: đối thủ không bịa được nữa (đã chặn từ bịa) -> tắc.
+        return _player_continuation_count(end, used_phrases | {item[1]}) == 0
+    kills = [c for c in candidates if is_kill_move(c)]
+    if kills:
+        # Trong các nước thắng, ưu tiên cụm quen cho tự nhiên; không có thì cụm hiếm cũng chốt.
+        curated_kills = [c for c in kills if c[1] not in word_game_external_phrases]
+        return random.choice(curated_kills or kills)[0]
+
     # Bot ưu tiên cụm PHỔ THÔNG (kho curated + từ đã học). Viet74K nhiều từ hiếm/cổ
     # (nhau nhảu, của thửa) chỉ dùng cứu bí khi không còn lựa chọn quen thuộc,
     # không thì bot thành máy phun từ cổ khiến người chơi tưởng bot bịa.
