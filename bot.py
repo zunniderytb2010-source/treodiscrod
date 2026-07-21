@@ -4788,7 +4788,15 @@ def _extract_json_object(text):
 
 
 def _admin_norm(s):
-    return re.sub(r"\s+", " ", (s or "").strip().lstrip("@#").casefold())
+    """Chuẩn hoá tên để so khớp: thường hoá, bỏ dấu, '-'/'_' thành space ('nối-từ' ~ 'noi tu')."""
+    s = (s or "").strip().lstrip("@#").replace("-", " ").replace("_", " ").lower().replace("đ", "d")
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# Từ thừa hay dính kèm tên kênh ("chat chung" = kênh chung, "tab game" = kênh game).
+_ADMIN_NOISE_WORDS = {"chat", "kenh", "tab", "channel", "phong", "room", "voice", "danh", "muc"}
 
 
 def _admin_find_channel(guild, name, kinds=None):
@@ -4796,13 +4804,30 @@ def _admin_find_channel(guild, name, kinds=None):
     if not name_n:
         return None
     pool = [c for c in guild.channels if kinds is None or isinstance(c, kinds)]
-    for c in pool:
-        if _admin_norm(c.name) == name_n:
-            return c
-    for c in pool:
-        if name_n in _admin_norm(c.name):
-            return c
-    return None
+
+    def lookup(query):
+        if not query:
+            return None
+        for c in pool:
+            if _admin_norm(c.name) == query:
+                return c
+        for c in pool:
+            if query in _admin_norm(c.name):
+                return c
+        # Tên kênh nằm TRONG câu ("chat chung" -> kênh 'chung'): khớp nguyên từ, lấy tên dài nhất.
+        best = None
+        for c in pool:
+            cn = _admin_norm(c.name)
+            if cn and re.search(rf"(?<!\S){re.escape(cn)}(?!\S)", query):
+                if best is None or len(cn) > len(_admin_norm(best.name)):
+                    best = c
+        return best
+
+    found = lookup(name_n)
+    if found:
+        return found
+    stripped = " ".join(w for w in name_n.split() if w not in _ADMIN_NOISE_WORDS)
+    return lookup(stripped)
 
 
 def _admin_find_role(guild, name):
@@ -4987,6 +5012,20 @@ async def handle_owner_admin_request(message, prompt):
     context = f"Tin nhắn chủ server: {prompt}"
     if mention_lines:
         context += "\nNgười được tag trong tin nhắn:\n" + "\n".join(mention_lines)
+    # Cho AI thấy tên THẬT trong server để trích đúng ("chat chung" -> kênh 'chung').
+    guild = message.guild
+    text_names = ", ".join(c.name for c in guild.text_channels[:60])
+    voice_names = ", ".join(c.name for c in guild.voice_channels[:30])
+    category_names = ", ".join(c.name for c in guild.categories[:20])
+    role_names = ", ".join(r.name for r in guild.roles[1:50])  # bỏ @everyone
+    context += (
+        f"\nKênh text hiện có: {text_names or '(không)'}"
+        f"\nKênh voice hiện có: {voice_names or '(không)'}"
+        f"\nDanh mục hiện có: {category_names or '(không)'}"
+        f"\nRole hiện có: {role_names or '(không)'}"
+        "\nKhi điền name/channel/category/role trong actions, PHẢI dùng đúng tên có thật ở danh sách trên "
+        "(chọn cái khớp ý chủ server nhất); tên mới đặt (new_name, create) thì lấy theo lời chủ server."
+    )
     raw = await _claude(
         [
             {"role": "system", "content": ADMIN_INTENT_PROMPT},
