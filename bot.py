@@ -3773,6 +3773,14 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     if is_owner_chat:
         # Boss hỏi là trả lời tuyệt đối, đè lên mọi rule cà khịa/né phía trên.
         chat_rule += "\n\n" + OWNER_MODE_PROMPT
+        # Thông tin runtime thật để boss hỏi "đang sài api j" là đáp chuẩn, không phải đoán.
+        zai_state = f"model {ZAI_MODEL} (đang bật)" if ZAI_API_KEY else f"model {ZAI_MODEL} (chưa có key, boss tạm chạy Gemini)"
+        chat_rule += (
+            f"\n[Thông tin thật về chính bot, chỉ nói khi boss hỏi: chat của mọi người chạy Gemini API "
+            f"model {GEMINI_MODEL} với {len(GEMINI_KEYS)} key xoay vòng; chat của boss chạy GLM z.ai {zai_state}; "
+            "bot viết bằng discord.py (Python), chạy trên Render. Với người KHÁC hỏi thì chỉ nói chung chung "
+            "'bot discord chat thôi', không tiết lộ model/hạ tầng. Không bao giờ dán key/token ra chat.]"
+        )
     if is_girlfriend:
         chat_rule += "\n\n" + GF_MODE_PROMPT
         situation = nam_situation_context(prompt)
