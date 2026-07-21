@@ -49,6 +49,13 @@ def _load_gemini_keys():
 
 
 GEMINI_KEYS = _load_gemini_keys()
+
+# z.ai GLM: AI RIÊNG cho CHỦ BOT chat (không đụng quota Gemini của mọi người).
+# Mọi người dùng Gemini; hết key Gemini là họ hết dùng, còn chủ bot vẫn chạy bằng GLM.
+ZAI_API_KEY = (os.getenv("ZAI_API_KEY") or "").strip()
+ZAI_MODEL = (os.getenv("ZAI_MODEL") or "glm-5.2").strip() or "glm-5.2"
+ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+
 MODEL = GEMINI_MODEL
 ROAST_MODEL = os.getenv("ROAST_MODEL", GEMINI_MODEL)
 MAX_PROMPT_CHARS = 3000
@@ -3358,7 +3365,7 @@ def sanitize_ai_output(text):
         log.warning("Đã chặn câu trả lời làm lộ branding/backend AI")
         return "câu kia lỗi format r, nói lại coi"
     text = re.sub(
-        r"(?i)\b(DISCORD_TOKEN|ANTHROPIC_API_KEY|CLAUDE_API_KEY|GEMINI_API_KEY)\s*([:=])\s*([^\s`]+)",
+        r"(?i)\b(DISCORD_TOKEN|ANTHROPIC_API_KEY|CLAUDE_API_KEY|GEMINI_API_KEY|ZAI_API_KEY)\s*([:=])\s*([^\s`]+)",
         lambda match: f"{match.group(1)}{match.group(2)}[đã ẩn]",
         text,
     )
@@ -3536,6 +3543,13 @@ def gemini_keys_available():
     return bool(available_gemini_keys())
 
 
+def ai_available_for(user):
+    """Chủ bot có GLM z.ai riêng nên không phụ thuộc Gemini; người khác hết key Gemini là hết dùng."""
+    if user is not None and getattr(user, "id", None) == OWNER_ID and ZAI_API_KEY:
+        return True
+    return gemini_keys_available()
+
+
 def _mark_key_exhausted(key):
     _gemini_key_cooldown[key] = time.time() + GEMINI_KEY_COOLDOWN
     log.warning("Gemini key ...%s hết lượt, nghỉ %ss", key[-4:], GEMINI_KEY_COOLDOWN)
@@ -3581,6 +3595,53 @@ def _to_gemini_payload(messages):
     return body
 
 
+def _to_openai_payload(messages):
+    """Đổi list {role, content} (block Anthropic) sang messages OpenAI-compatible cho z.ai.
+
+    Ảnh chuyển thành image_url data-url (model vision đọc được, model text thì z.ai tự bỏ/lỗi
+    -> caller rơi về Gemini).
+    """
+    out = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": m["role"], "content": content})
+            continue
+        parts = []
+        for block in content:
+            if block.get("type") == "text":
+                parts.append({"type": "text", "text": block.get("text", "")})
+            elif block.get("type") == "image":
+                src = block.get("source", {})
+                if src.get("data"):
+                    parts.append({"type": "image_url", "image_url": {
+                        "url": f"data:{src.get('media_type', 'image/png')};base64,{src['data']}",
+                    }})
+        out.append({"role": m["role"], "content": parts})
+    return out
+
+
+async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
+    """Gọi GLM của z.ai (chỉ dành cho chủ bot). Lỗi thì raise để caller rơi về Gemini."""
+    body = {
+        "model": ZAI_MODEL,
+        "messages": _to_openai_payload(messages),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    headers = {"Authorization": f"Bearer {ZAI_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(ZAI_API_URL, json=body, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    text = ((choices[0].get("message") or {}).get("content")) or ""
+    return clean_answer(text)
+
+
 # Bot cà khịa nhẹ; nới bộ lọc để đừng chặn oan, nhưng vẫn giữ mức chặn cao cho nội dung nặng.
 _GEMINI_SAFETY = [
     {"category": c, "threshold": "BLOCK_ONLY_HIGH"} for c in (
@@ -3590,12 +3651,19 @@ _GEMINI_SAFETY = [
 ]
 
 
-async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None):
+async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None, owner=False):
     """Gọi Gemini API, xoay qua các key. Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
 
     thinking_budget bỏ (Gemini flash không có). Hết sạch key -> AllKeysExhaustedError.
+    owner=True: chủ bot chat -> dùng GLM z.ai riêng, không đốt key Gemini của mọi người;
+    GLM lỗi mới rơi về Gemini.
     """
     global _gemini_key_index
+    if owner and ZAI_API_KEY:
+        try:
+            return await _zai(messages, max_tokens=max_tokens, temperature=temperature)
+        except Exception as exc:
+            log.warning("z.ai GLM lỗi (%s), chủ bot tạm rơi về Gemini", type(exc).__name__)
     keys = _keys_in_rotation()
     if not keys:
         raise AllKeysExhaustedError()
@@ -3641,6 +3709,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     """Chat có memory theo (channel, user)."""
     channel_id = key[0]
     is_girlfriend = key[1] == GIRLFRIEND_ID
+    is_owner_chat = key[1] == OWNER_ID  # chủ bot -> chạy GLM z.ai riêng
 
     # Toán đơn giản: tự tính cho chắc đúng, model nhỏ hay tính sai/né.
     if not image_blocks:
@@ -3723,7 +3792,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     else:
         temperature = 0.8
     thinking_budget = CODE_THINKING_BUDGET if code_mode else (OWNER_THINKING_BUDGET if force_thinking else 0)
-    answer = await _claude(messages, max_tokens, temperature, thinking_budget)
+    answer = await _claude(messages, max_tokens, temperature, thinking_budget, owner=is_owner_chat)
 
     # Một lần sửa định dạng nếu model hứa đưa code nhưng chưa thực sự dán code.
     if code_mode and requires_code_block(prompt) and "```" not in answer:
@@ -3738,7 +3807,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 ),
             },
         ]
-        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET)
+        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_owner_chat)
 
     # Model phun THOUGHT/phân tích thay vì lời chat: cắt meta, nếu vẫn hỏng thì hỏi lại 1 lần cực gắt.
     if not code_mode:
@@ -3752,7 +3821,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 )},
             ]
             try:
-                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0)
+                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0, owner=is_owner_chat)
                 retry = strip_meta_reasoning(retry)
                 cleaned = retry if (retry and not looks_like_meta(retry)) else ""
             except Exception:
@@ -4561,8 +4630,8 @@ async def on_message(message):
 
     # Câu chửi ngắn: để model tự đốp cho tự nhiên, không lặp; lỗi mới rơi về câu cứng.
     if is_short_insult(prompt):
-        if not gemini_keys_available():
-            return  # hết key thì im
+        if not ai_available_for(message.author):
+            return  # hết key thì im (chủ bot có GLM riêng nên vẫn chạy)
         if on_quick_cooldown(message.channel.id, message.author.id):
             try:
                 await message.add_reaction("⏳")
@@ -4578,8 +4647,8 @@ async def on_message(message):
             await handle_short_insult(message, prompt)
         return
 
-    if not gemini_keys_available():
-        return  # hết sạch key thì bot im, không trả lời tin nào cần AI
+    if not ai_available_for(message.author):
+        return  # hết sạch key thì bot im với mọi người; chủ bot vẫn chạy bằng GLM z.ai
 
     if on_cooldown(message.author.id, message.channel.id):
         await message.add_reaction("⏳")
@@ -4613,6 +4682,14 @@ async def on_message(message):
                   "Có thể gợi ý tối đa 3 lệnh để owner tự xem xét và tự gửi."
             ).strip()
 
+    # TRỢ LÝ ADMIN: chủ bot nhắn tự nhiên (mute A, tạo tab B, thêm role C...) -> tự hiểu tự làm.
+    if is_owner(message.author) and message.guild:
+        try:
+            if await handle_owner_admin_request(message, prompt):
+                return
+        except Exception as exc:
+            log.warning("Trợ lý admin lỗi (%s), rơi về chat thường", type(exc).__name__)
+
     log.info(f"AI call: {message.author} in #{message.channel}: {prompt[:60]!r}")
     async with message.channel.typing():
         try:
@@ -4629,6 +4706,277 @@ async def on_message(message):
         except Exception as e:
             log.error("Claude request failed in chat (%s)", type(e).__name__)
             await send_reply(message, claude_discord_error(e))
+
+
+# ==================== TRỢ LÝ ADMIN CHO CHỦ BOT ====================
+# Chủ bot nhắn tự nhiên ("mute thằng A 10 phút", "tạo tab học tập", "cho B role mod"...)
+# -> AI đọc hiểu, trích hành động, bot tự làm. KHÔNG lệnh cứng. Chỉ OWNER_ID được dùng.
+ADMIN_INTENT_PROMPT = (
+    "Bạn là bộ điều phối quản trị Discord của Zun bot. Chủ server nhắn cho bot bằng ngôn ngữ "
+    "tự nhiên; xác định xem tin nhắn có phải YÊU CẦU HÀNH ĐỘNG QUẢN TRỊ SERVER không và trích xuất hành động.\n"
+    "Các hành động hỗ trợ (type):\n"
+    '- timeout: mute/câm mồm ai đó. Tham số: target, minutes (mặc định 10), reason.\n'
+    '- untimeout: bỏ mute. Tham số: target.\n'
+    '- ban: ban khỏi server. Tham số: target, reason.\n'
+    '- unban: gỡ ban. Tham số: target.\n'
+    '- kick: đá khỏi server. Tham số: target, reason.\n'
+    '- add_role / remove_role: thêm/gỡ role cho người. Tham số: target, role.\n'
+    '- create_role: tạo role mới. Tham số: name, color (hex "#ff0000", tuỳ chọn).\n'
+    '- delete_role: xoá role. Tham số: name.\n'
+    '- create_channel: tạo kênh/tab mới. Tham số: name, kind ("text"|"voice"|"category"), category (tuỳ chọn).\n'
+    '- delete_channel: xoá kênh/tab. Tham số: name.\n'
+    '- rename_channel: đổi tên kênh. Tham số: name, new_name.\n'
+    '- move_channel: chuyển kênh vào danh mục. Tham số: name, category.\n'
+    '- slowmode: đặt chế độ chậm. Tham số: channel (bỏ trống = kênh hiện tại), seconds.\n'
+    'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...]}.\n'
+    'Tin nhắn chỉ là chat thường (hỏi han, cà khịa, nhờ code, chơi game, kể chuyện) thì trả {"actions": []}. '
+    "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON."
+)
+
+
+def _extract_json_object(text):
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+
+
+def _admin_norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip().lstrip("@#").casefold())
+
+
+def _admin_find_channel(guild, name, kinds=None):
+    name_n = _admin_norm(name)
+    if not name_n:
+        return None
+    pool = [c for c in guild.channels if kinds is None or isinstance(c, kinds)]
+    for c in pool:
+        if _admin_norm(c.name) == name_n:
+            return c
+    for c in pool:
+        if name_n in _admin_norm(c.name):
+            return c
+    return None
+
+
+def _admin_find_role(guild, name):
+    name_n = _admin_norm(name)
+    if not name_n:
+        return None
+    for r in guild.roles:
+        if _admin_norm(r.name) == name_n:
+            return r
+    for r in guild.roles:
+        if name_n in _admin_norm(r.name):
+            return r
+    return None
+
+
+async def _admin_find_member(message, name):
+    """Tìm người theo id/mention/tên (khớp đúng rồi mới khớp gần); không thấy trả None."""
+    guild = message.guild
+    name_n = _admin_norm(name)
+    digits = re.sub(r"\D", "", name or "")
+    if digits:
+        member = guild.get_member(int(digits))
+        if member:
+            return member
+        try:
+            return await guild.fetch_member(int(digits))
+        except Exception:
+            pass
+    bot_id = bot.user.id if bot.user else 0
+    mentioned = [m for m in message.mentions if m.id != bot_id]
+    for m in mentioned:
+        if name_n and (_admin_norm(m.display_name) == name_n or _admin_norm(m.name) == name_n):
+            return m
+    if len(mentioned) == 1:
+        return mentioned[0]  # tag đúng 1 người thì chính là họ
+    if not name_n:
+        return None
+    member = guild.get_member_named(name or "")
+    if member:
+        return member
+    for m in guild.members:
+        if _admin_norm(m.display_name) == name_n or _admin_norm(m.name) == name_n:
+            return m
+    for m in guild.members:
+        if name_n in _admin_norm(m.display_name) or name_n in _admin_norm(m.name):
+            return m
+    try:  # cache thiếu (không bật members intent) -> hỏi gateway theo prefix tên
+        found = await guild.query_members(query=name_n, limit=5)
+        if found:
+            return found[0]
+    except Exception:
+        pass
+    return None
+
+
+def _admin_parse_color(value):
+    try:
+        return discord.Colour(int(str(value).lstrip("#"), 16))
+    except (ValueError, TypeError):
+        return None
+
+
+async def _run_admin_action(message, action):
+    guild = message.guild
+    a_type = str(action.get("type") or "").strip().lower()
+    target = action.get("target") or ""
+    reason = str(action.get("reason") or "Chủ bot yêu cầu qua Zun")[:400]
+
+    async def need_member():
+        member = await _admin_find_member(message, target)
+        if member is None:
+            raise LookupError(f'không tìm thấy ai tên "{target}", tag thẳng người đó cho chắc')
+        return member
+
+    if a_type in {"timeout", "mute"}:
+        member = await need_member()
+        minutes = 10
+        try:
+            minutes = max(1, min(int(action.get("minutes") or 10), 40320))  # Discord max 28 ngày
+        except (ValueError, TypeError):
+            pass
+        await member.timeout(datetime.timedelta(minutes=minutes), reason=reason)
+        return f"✅ đã mute {member.display_name} {minutes} phút"
+    if a_type in {"untimeout", "unmute"}:
+        member = await need_member()
+        await member.timeout(None, reason=reason)
+        return f"✅ đã bỏ mute {member.display_name}"
+    if a_type == "ban":
+        member = await need_member()
+        await member.ban(reason=reason)
+        return f"✅ đã ban {member.display_name}"
+    if a_type == "unban":
+        digits = re.sub(r"\D", "", str(target))
+        if digits:
+            await guild.unban(discord.Object(id=int(digits)), reason=reason)
+            return f"✅ đã gỡ ban id {digits}"
+        name_n = _admin_norm(target)
+        async for entry in guild.bans(limit=None):
+            if name_n and name_n in _admin_norm(entry.user.name):
+                await guild.unban(entry.user, reason=reason)
+                return f"✅ đã gỡ ban {entry.user.name}"
+        raise LookupError(f'không thấy "{target}" trong danh sách ban')
+    if a_type == "kick":
+        member = await need_member()
+        await member.kick(reason=reason)
+        return f"✅ đã kick {member.display_name}"
+    if a_type in {"add_role", "remove_role"}:
+        member = await need_member()
+        role = _admin_find_role(guild, action.get("role"))
+        if role is None:
+            raise LookupError(f'không có role tên "{action.get("role")}"')
+        if a_type == "add_role":
+            await member.add_roles(role, reason=reason)
+            return f"✅ đã thêm role {role.name} cho {member.display_name}"
+        await member.remove_roles(role, reason=reason)
+        return f"✅ đã gỡ role {role.name} khỏi {member.display_name}"
+    if a_type == "create_role":
+        name = str(action.get("name") or "").strip() or "role mới"
+        color = _admin_parse_color(action.get("color"))
+        role = await guild.create_role(name=name, colour=color or discord.Colour.default(), reason=reason)
+        return f"✅ đã tạo role {role.name}"
+    if a_type == "delete_role":
+        role = _admin_find_role(guild, action.get("name"))
+        if role is None:
+            raise LookupError(f'không có role tên "{action.get("name")}"')
+        await role.delete(reason=reason)
+        return f"✅ đã xoá role {role.name}"
+    if a_type == "create_channel":
+        name = str(action.get("name") or "").strip() or "kênh mới"
+        kind = str(action.get("kind") or "text").strip().lower()
+        category = _admin_find_channel(guild, action.get("category"), kinds=discord.CategoryChannel)
+        if kind == "category":
+            ch = await guild.create_category(name, reason=reason)
+        elif kind == "voice":
+            ch = await guild.create_voice_channel(name, category=category, reason=reason)
+        else:
+            ch = await guild.create_text_channel(name, category=category, reason=reason)
+        return f"✅ đã tạo {'danh mục' if kind == 'category' else 'kênh'} {ch.name}"
+    if a_type == "delete_channel":
+        ch = _admin_find_channel(guild, action.get("name"))
+        if ch is None:
+            raise LookupError(f'không có kênh tên "{action.get("name")}"')
+        await ch.delete(reason=reason)
+        return f"✅ đã xoá kênh {ch.name}"
+    if a_type == "rename_channel":
+        ch = _admin_find_channel(guild, action.get("name"))
+        if ch is None:
+            raise LookupError(f'không có kênh tên "{action.get("name")}"')
+        new_name = str(action.get("new_name") or "").strip()
+        if not new_name:
+            raise LookupError("thiếu tên mới")
+        await ch.edit(name=new_name, reason=reason)
+        return f"✅ đã đổi tên kênh thành {new_name}"
+    if a_type == "move_channel":
+        ch = _admin_find_channel(guild, action.get("name"))
+        category = _admin_find_channel(guild, action.get("category"), kinds=discord.CategoryChannel)
+        if ch is None or category is None:
+            raise LookupError("không thấy kênh hoặc danh mục")
+        await ch.edit(category=category, reason=reason)
+        return f"✅ đã chuyển {ch.name} vào {category.name}"
+    if a_type == "slowmode":
+        ch = _admin_find_channel(guild, action.get("channel"), kinds=discord.TextChannel) or message.channel
+        seconds = 0
+        try:
+            seconds = max(0, min(int(action.get("seconds") or 0), 21600))
+        except (ValueError, TypeError):
+            pass
+        await ch.edit(slowmode_delay=seconds, reason=reason)
+        return f"✅ slowmode #{ch.name} = {seconds}s"
+    raise LookupError(f'không hiểu hành động "{a_type}"')
+
+
+async def handle_owner_admin_request(message, prompt):
+    """Chủ bot nhắn tự nhiên -> AI trích hành động quản trị, bot tự làm.
+
+    Trả True nếu đã xử lý (khỏi chat thường); False nếu chỉ là chat.
+    """
+    bot_id = bot.user.id if bot.user else 0
+    mention_lines = [
+        f"- {m.display_name} (id {m.id})" for m in message.mentions if m.id != bot_id
+    ]
+    context = f"Tin nhắn chủ server: {prompt}"
+    if mention_lines:
+        context += "\nNgười được tag trong tin nhắn:\n" + "\n".join(mention_lines)
+    raw = await _claude(
+        [
+            {"role": "system", "content": ADMIN_INTENT_PROMPT},
+            {"role": "user", "content": context},
+        ],
+        max_tokens=700,
+        temperature=0,
+        owner=True,
+    )
+    data = _extract_json_object(raw)
+    actions = data.get("actions") if isinstance(data, dict) else None
+    if not isinstance(actions, list) or not actions:
+        return False
+    results = []
+    for action in actions[:10]:
+        if not isinstance(action, dict):
+            continue
+        try:
+            results.append(await _run_admin_action(message, action))
+        except LookupError as exc:
+            results.append(f"❌ {exc}")
+        except discord.Forbidden:
+            results.append(
+                f"❌ bot thiếu quyền làm '{action.get('type')}' (cấp quyền + kéo role bot lên trên role đích)"
+            )
+        except Exception as exc:
+            results.append(f"❌ '{action.get('type')}' lỗi {type(exc).__name__}")
+    if not results:
+        return False
+    await send_reply(message, "\n".join(results))
+    return True
 
 
 # ==================== SLASH COMMANDS ====================
