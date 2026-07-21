@@ -4520,22 +4520,26 @@ async def on_message(message):
     is_open_pc = bool(ZUN_OS_OPEN_RE.fullmatch(normalize_word_game_text(content)))
 
     # HỘI THOẠI LIÊN TỤC với chủ bot: gọi "zun"/ping/reply 1 lần là mở phiên trong kênh,
-    # các câu sau bot tự trả lời không cần gọi lại; ping NGƯỜI KHÁC là đóng phiên.
+    # các câu sau bot tự trả lời không cần gọi lại. Tin ping/reply NGƯỜI KHÁC trong phiên
+    # KHÔNG chặn cứng: để AI đọc phán boss đang nói với bot ("mute thk chó này") hay với họ.
     owner_convo = False
+    owner_convo_check = False
     if message.author.id == OWNER_ID:
         other_mentions = [m for m in message.mentions if bot.user and m.id != bot.user.id]
+        replied_other = bool(ref and bot.user and ref.author.id != bot.user.id)
         now_ts = time.time()
         if is_ask or mentioned or wake or reply_to_bot:
             owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
-        elif other_mentions:
-            owner_convo_until.pop(message.channel.id, None)  # boss quay sang nói với người khác
         elif owner_convo_until.get(message.channel.id, 0) > now_ts:
-            owner_convo = True
+            if other_mentions or replied_other:
+                owner_convo_check = True  # AI sẽ phán: lệnh cho bot hay nói chuyện với người kia
+            else:
+                owner_convo = True
             owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
 
     if not (
         is_ask or mentioned or wake or reply_to_bot or prefix_moderation
-        or text_economy_command or has_game_session or is_open_pc or owner_convo
+        or text_economy_command or has_game_session or is_open_pc or owner_convo or owner_convo_check
     ):
         return
 
@@ -4747,7 +4751,7 @@ async def on_message(message):
         # (huỷ chat), không thì lấy câu chat — chỉ chờ 1 lượt AI thay vì 2 lượt nối đuôi.
         admin_task = None
         if is_owner(message.author) and message.guild:
-            admin_task = asyncio.create_task(parse_owner_admin_actions(message, prompt))
+            admin_task = asyncio.create_task(parse_owner_admin_actions(message, prompt, ref))
         chat_task = asyncio.create_task(ai_chat(
             gid,
             key,
@@ -4757,16 +4761,19 @@ async def on_message(message):
             image_blocks=image_blocks,
             force_thinking=gid in thinking_guilds,
         ))
-        actions = []
+        actions, to_bot = [], True
         if admin_task is not None:
             try:
-                actions = await admin_task
+                actions, to_bot = await admin_task
             except Exception as exc:
                 log.warning("Trợ lý admin lỗi (%s), rơi về chat thường", type(exc).__name__)
         if actions:
             chat_task.cancel()
             await run_owner_admin_actions(message, prompt, actions)
             return
+        if owner_convo_check and not to_bot:
+            chat_task.cancel()
+            return  # boss đang nói với người kia, bot không chen
         try:
             answer = await chat_task
             await send_reply_chunks(message, answer)
@@ -4797,8 +4804,12 @@ ADMIN_INTENT_PROMPT = (
     '- slowmode: đặt chế độ chậm. Tham số: channel (bỏ trống = kênh hiện tại), seconds.\n'
     '- create_invite: tạo link mời vào server ("đưa link sv", "cho xin invite"). Tham số: '
     'channel (bỏ trống = kênh hiện tại), max_age_hours (0 = vĩnh viễn, mặc định 0), max_uses (0 = vô hạn).\n'
-    'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...]}.\n'
-    'Tin nhắn chỉ là chat thường (hỏi han, cà khịa, nhờ code, chơi game, kể chuyện) thì trả {"actions": []}. '
+    'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...], "to_bot": true|false}.\n'
+    '"to_bot" = tin nhắn có đang nói VỚI BOT Zun không: ra lệnh/hỏi/chat với bot -> true; '
+    "boss đang nói chuyện với NGƯỜI KHÁC (đáp lời người được tag/reply, khịa họ, tán gẫu với họ) -> false và actions [].\n"
+    'LỆNH XỬ người được tag/reply vẫn là nói với bot: "mute thk chó này" khi đang reply/tag ai đó '
+    '-> {"actions":[{"type":"timeout","target":"id người đó","minutes":10}], "to_bot": true}.\n'
+    'Tin nhắn chỉ là chat thường với bot (hỏi han, cà khịa, nhờ code, chơi game) thì trả {"actions": [], "to_bot": true}. '
     "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON.\n"
     'QUAN TRỌNG: yêu cầu NỐI TIẾP kiểu "đổi lại đi", "hoàn tác", "xoá cái vừa tạo", "thôi trả về như cũ" '
     "vẫn LÀ hành động quản trị: dựa vào hội thoại ngay trước đó để suy ra hành động cụ thể "
@@ -5047,8 +5058,11 @@ async def _run_admin_action(message, action):
     raise LookupError(f'không hiểu hành động "{a_type}"')
 
 
-async def parse_owner_admin_actions(message, prompt):
-    """AI đọc tin chủ bot (kèm hội thoại gần đây) -> list hành động quản trị ([] = chỉ là chat)."""
+async def parse_owner_admin_actions(message, prompt, ref=None):
+    """AI đọc tin chủ bot (kèm hội thoại gần đây) -> (actions, to_bot).
+
+    actions = [] nếu chỉ là chat; to_bot = False nếu boss đang nói với NGƯỜI KHÁC chứ không phải bot.
+    """
     bot_id = bot.user.id if bot.user else 0
     mention_lines = [
         f"- {m.display_name} (id {m.id})" for m in message.mentions if m.id != bot_id
@@ -5056,6 +5070,11 @@ async def parse_owner_admin_actions(message, prompt):
     context = f"Tin nhắn chủ server: {prompt}"
     if mention_lines:
         context += "\nNgười được tag trong tin nhắn:\n" + "\n".join(mention_lines)
+    if ref is not None and ref.author.id != bot_id:
+        context += (
+            f"\nTin này đang REPLY tin của {ref.author.display_name} (id {ref.author.id}): "
+            f"{(ref.content or '(ảnh/file)')[:200]}"
+        )
     # Hội thoại gần đây để hiểu yêu cầu NỐI TIẾP: "đổi lại đi", "xoá cái vừa tạo", "thôi như cũ"...
     mem_key = (message.channel.id, message.author.id)
     recent = [m for m in list(memory[mem_key])[-8:] if isinstance(m.get("content"), str)]
@@ -5088,10 +5107,13 @@ async def parse_owner_admin_actions(message, prompt):
         owner=True,
     )
     data = _extract_json_object(raw)
-    actions = data.get("actions") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return [], True
+    actions = data.get("actions")
     if not isinstance(actions, list):
-        return []
-    return [a for a in actions[:10] if isinstance(a, dict)]
+        actions = []
+    to_bot = bool(data.get("to_bot", True))
+    return [a for a in actions[:10] if isinstance(a, dict)], to_bot
 
 
 async def run_owner_admin_actions(message, prompt, actions):
