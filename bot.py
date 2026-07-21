@@ -4778,6 +4778,8 @@ ADMIN_INTENT_PROMPT = (
     '- rename_channel: đổi tên kênh. Tham số: name, new_name.\n'
     '- move_channel: chuyển kênh vào danh mục. Tham số: name, category.\n'
     '- slowmode: đặt chế độ chậm. Tham số: channel (bỏ trống = kênh hiện tại), seconds.\n'
+    '- create_invite: tạo link mời vào server ("đưa link sv", "cho xin invite"). Tham số: '
+    'channel (bỏ trống = kênh hiện tại), max_age_hours (0 = vĩnh viễn, mặc định 0), max_uses (0 = vô hạn).\n'
     'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...]}.\n'
     'Tin nhắn chỉ là chat thường (hỏi han, cà khịa, nhờ code, chơi game, kể chuyện) thì trả {"actions": []}. '
     "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON.\n"
@@ -5001,6 +5003,21 @@ async def _run_admin_action(message, action):
             raise LookupError("không thấy kênh hoặc danh mục")
         await ch.edit(category=category, reason=reason)
         return f"✅ đã chuyển {ch.name} vào {category.name}"
+    if a_type == "create_invite":
+        fallback = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
+        ch = _admin_find_channel(guild, action.get("channel"), kinds=(discord.TextChannel, discord.VoiceChannel)) or fallback
+        hours = uses = 0
+        try:
+            hours = max(0, min(int(action.get("max_age_hours") or 0), 168))
+        except (ValueError, TypeError):
+            pass
+        try:
+            uses = max(0, min(int(action.get("max_uses") or 0), 100))
+        except (ValueError, TypeError):
+            pass
+        invite = await ch.create_invite(max_age=hours * 3600, max_uses=uses, reason=reason)
+        tail = "" if not hours else f" (hết hạn sau {hours}h)"
+        return f"✅ link mời: {invite.url}{tail}"
     if a_type == "slowmode":
         ch = _admin_find_channel(guild, action.get("channel"), kinds=discord.TextChannel) or message.channel
         seconds = 0
