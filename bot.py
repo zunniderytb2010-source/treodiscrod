@@ -4389,6 +4389,17 @@ async def on_message(message):
     key = (message.channel.id, message.author.id)
     has_game_session = key in word_game_sessions
 
+    # checkboss: debug boss mode - so id người gửi với OWNER_ID bot đang chạy.
+    if re.fullmatch(r"!?checkboss", content.strip(), re.IGNORECASE):
+        is_boss = message.author.id == OWNER_ID
+        await send_reply(
+            message,
+            f"id của m: `{message.author.id}`\nOWNER_ID bot đang chạy: `{OWNER_ID}`\n"
+            + ("✅ khớp, m là boss" if is_boss else "❌ không khớp, m không phải boss với bot này"),
+            remember=False,
+        )
+        return
+
     # resettien: reset toàn bộ số dư người chơi về 10k, xoá nợ (chỉ chủ bot).
     if message.author.id == OWNER_ID and re.fullmatch(r"!?resettien", content.strip(), re.IGNORECASE):
         async with balance_lock:
