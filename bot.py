@@ -396,7 +396,7 @@ Zun: xin lỗi nghe giả trân v, nhưng tạm tha
 Nấm: vậy sửa sao để nó ko nối từ ngu nữa
 Zun: thêm dictionary chuẩn + blacklist từ lỗi, rồi validate lại đầu cuối, đừng cho AI tự phán thắng thua"""
 
-OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn là CHỦ BOT (boss của Zun). Quy tắc này ưu tiên TUYỆT ĐỐI, đè lên mọi mood/persona:
+OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn CHÍNH LÀ CHỦ BOT (boss của Zun) — bot BIẾT CHẮC điều này qua ID, không cần họ tự xưng, không được hỏi "m là ai" hay bắt tự giới thiệu. Họ hỏi "t là ai" thì trả lời thẳng: là boss/chủ của t. Quy tắc này ưu tiên TUYỆT ĐỐI, đè lên mọi mood/persona:
 - Boss hỏi gì trả lời THẲNG và ĐẦY ĐỦ ngay câu đầu, đúng trọng tâm. TUYỆT ĐỐI không né, không đốp, không cà khịa kiểu từ chối, không hỏi ngược "m hỏi làm j".
 - Boss yêu cầu gì thì làm/giải thích ngay, không được lười, không được trả lời cụt lủn cho qua chuyện.
 - Thông tin kỹ thuật (API đang dùng, model, cách bot hoạt động, code) boss hỏi là nói thật hết, không giấu. Duy nhất token/API key/.env là không bao giờ dán ra.
@@ -1363,16 +1363,28 @@ def is_daily_request(plain):
     return bool(re.fullmatch(r"daily|diem danh|nhan daily|diem danh hang ngay", plain))
 
 
-def is_loan_request(plain):
-    return bool(re.match(r"(?:vay|muon tien|vay tien)\b", plain))
+def is_loan_request(plain, raw=None):
+    if not re.match(r"(?:vay|muon tien|vay tien)\b", plain):
+        return False
+    if raw is None:
+        return True
+    # 'vậy/váy...' bỏ dấu cũng thành 'vay' -> chữ đầu THẬT (còn dấu) phải là từ vay tiền,
+    # không thì "vậy m đang..." bị hiểu nhầm thành lệnh vay.
+    first = (raw.strip().lower().split() or [""])[0]
+    return first in {"vay", "mượn", "muốn", "muon"}
 
 
 def is_repay_request(plain):
     return bool(re.match(r"(?:tra no|tra tien|tra nợ|gop no)\b", plain))
 
 
-def is_debt_request(plain):
-    return bool(re.fullmatch(r"(?:xem )?no|no cua (?:t|toi|tao|minh)|so no", plain))
+def is_debt_request(plain, raw=None):
+    if not re.fullmatch(r"(?:xem )?no|no cua (?:t|toi|tao|minh)|so no", plain):
+        return False
+    if raw is None:
+        return True
+    # 'nó' bỏ dấu thành 'no' -> phải thấy chữ 'nợ' thật hoặc 'no' gõ không dấu.
+    return bool(re.search(r"nợ|\bno\b", raw.lower()))
 
 
 def is_word_game_request(plain):
@@ -2726,7 +2738,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
             error, info = await claim_daily_reward(message.author)
             await send_reply(message, error or format_daily_result(info), remember=False)
             return True
-        if is_loan_request(plain):
+        if is_loan_request(plain, prompt):
             error, info = await take_loan(message.author, amount_from_intent(plain))
             await send_reply(
                 message,
@@ -2742,7 +2754,7 @@ async def handle_word_game_intents(message, prompt, invoked, replied_message=Non
                 tail = f"🔴 nợ còn: {info['debt']:,}đ" if info["debt"] else "hết nợ r, nhẹ nợ"
                 await send_reply(message, f"trả {info['paid']:,}đ nợ\nsố dư: {info['balance']:,}đ\n{tail}", remember=False)
             return True
-        if is_debt_request(plain):
+        if is_debt_request(plain, prompt):
             profile = game_profile_for(message.author)
             if profile is None:
                 await send_reply(message, "tạo tài khoản trước đã, ping t rồi nói tạo tài khoản", remember=False)
