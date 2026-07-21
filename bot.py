@@ -5065,7 +5065,14 @@ async def run_owner_admin_actions(message, prompt, actions):
     results = []
     for action in actions:
         try:
-            results.append(await _run_admin_action(message, action))
+            # Discord rate-limit (vd đổi tên kênh 2 lần/10 phút) làm discord.py ngủ chờ
+            # cả chục phút -> bot treo "đang nhập". Quá 15s là huỷ, báo thẳng.
+            results.append(await asyncio.wait_for(_run_admin_action(message, action), timeout=15))
+        except asyncio.TimeoutError:
+            results.append(
+                f"❌ '{action.get('type')}' bị Discord rate-limit giữ lại "
+                "(đổi tên kênh chỉ được 2 lần/10 phút) — chờ vài phút rồi làm lại"
+            )
         except LookupError as exc:
             results.append(f"❌ {exc}")
         except discord.Forbidden:
