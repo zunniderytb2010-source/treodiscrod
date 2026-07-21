@@ -401,7 +401,8 @@ OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn CHÍNH LÀ CHỦ BOT (bo
 - Boss yêu cầu gì thì làm/giải thích ngay, không được lười, không được trả lời cụt lủn cho qua chuyện.
 - Thông tin kỹ thuật (API đang dùng, model, cách bot hoạt động, code) boss hỏi là nói thật hết, không giấu. Duy nhất token/API key/.env là không bao giờ dán ra.
 - Vẫn giữ giọng Zun thân quen (t-m, viết thường) nhưng thái độ là trợ lý ruột: nhiệt tình, chính xác, chi tiết khi cần.
-- Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa."""
+- Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa.
+- CẤM chém đã làm hành động quản trị (đổi tên kênh, mute, tạo role...) khi hội thoại không có kết quả ✅ thật. Chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi"."""
 
 GREETINGS = ["sao", "gì", "ơi", "nói", "đây", "j", "hỏi lẹ", "nghe", "hử", "j đấy", "nói nghe coi", "gọi t có j"]
 SNARKS = ["rồi sao", "lại j", "m muốn j", "ảo thật", "gì căng", "nói lẹ", "đang nghe", "lại gì nữa đây", "bận lắm nói lẹ", "gọi như đòi nợ"]
@@ -4723,26 +4724,34 @@ async def on_message(message):
                   "Có thể gợi ý tối đa 3 lệnh để owner tự xem xét và tự gửi."
             ).strip()
 
-    # TRỢ LÝ ADMIN: chủ bot nhắn tự nhiên (mute A, tạo tab B, thêm role C...) -> tự hiểu tự làm.
-    if is_owner(message.author) and message.guild:
-        try:
-            if await handle_owner_admin_request(message, prompt):
-                return
-        except Exception as exc:
-            log.warning("Trợ lý admin lỗi (%s), rơi về chat thường", type(exc).__name__)
-
     log.info(f"AI call: {message.author} in #{message.channel}: {prompt[:60]!r}")
     async with message.channel.typing():
+        # TRỢ LÝ ADMIN chạy SONG SONG với chat cho nhanh: có hành động thì làm hành động
+        # (huỷ chat), không thì lấy câu chat — chỉ chờ 1 lượt AI thay vì 2 lượt nối đuôi.
+        admin_task = None
+        if is_owner(message.author) and message.guild:
+            admin_task = asyncio.create_task(parse_owner_admin_actions(message, prompt))
+        chat_task = asyncio.create_task(ai_chat(
+            gid,
+            key,
+            prompt,
+            extra_context=extra,
+            user_name=message.author.display_name,
+            image_blocks=image_blocks,
+            force_thinking=gid in thinking_guilds,
+        ))
+        actions = []
+        if admin_task is not None:
+            try:
+                actions = await admin_task
+            except Exception as exc:
+                log.warning("Trợ lý admin lỗi (%s), rơi về chat thường", type(exc).__name__)
+        if actions:
+            chat_task.cancel()
+            await run_owner_admin_actions(message, prompt, actions)
+            return
         try:
-            answer = await ai_chat(
-                gid,
-                key,
-                prompt,
-                extra_context=extra,
-                user_name=message.author.display_name,
-                image_blocks=image_blocks,
-                force_thinking=gid in thinking_guilds,
-            )
+            answer = await chat_task
             await send_reply_chunks(message, answer)
         except Exception as e:
             log.error("Claude request failed in chat (%s)", type(e).__name__)
@@ -4771,7 +4780,11 @@ ADMIN_INTENT_PROMPT = (
     '- slowmode: đặt chế độ chậm. Tham số: channel (bỏ trống = kênh hiện tại), seconds.\n'
     'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...]}.\n'
     'Tin nhắn chỉ là chat thường (hỏi han, cà khịa, nhờ code, chơi game, kể chuyện) thì trả {"actions": []}. '
-    "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON."
+    "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON.\n"
+    'QUAN TRỌNG: yêu cầu NỐI TIẾP kiểu "đổi lại đi", "hoàn tác", "xoá cái vừa tạo", "thôi trả về như cũ" '
+    "vẫn LÀ hành động quản trị: dựa vào hội thoại ngay trước đó để suy ra hành động cụ thể "
+    '(vd vừa đổi tên kênh "chung" thành "chat gay", chủ nói "đổi lại đi" -> '
+    '{"actions":[{"type":"rename_channel","name":"chat gay","new_name":"chung"}]}).'
 )
 
 
@@ -5000,11 +5013,8 @@ async def _run_admin_action(message, action):
     raise LookupError(f'không hiểu hành động "{a_type}"')
 
 
-async def handle_owner_admin_request(message, prompt):
-    """Chủ bot nhắn tự nhiên -> AI trích hành động quản trị, bot tự làm.
-
-    Trả True nếu đã xử lý (khỏi chat thường); False nếu chỉ là chat.
-    """
+async def parse_owner_admin_actions(message, prompt):
+    """AI đọc tin chủ bot (kèm hội thoại gần đây) -> list hành động quản trị ([] = chỉ là chat)."""
     bot_id = bot.user.id if bot.user else 0
     mention_lines = [
         f"- {m.display_name} (id {m.id})" for m in message.mentions if m.id != bot_id
@@ -5012,6 +5022,14 @@ async def handle_owner_admin_request(message, prompt):
     context = f"Tin nhắn chủ server: {prompt}"
     if mention_lines:
         context += "\nNgười được tag trong tin nhắn:\n" + "\n".join(mention_lines)
+    # Hội thoại gần đây để hiểu yêu cầu NỐI TIẾP: "đổi lại đi", "xoá cái vừa tạo", "thôi như cũ"...
+    mem_key = (message.channel.id, message.author.id)
+    recent = [m for m in list(memory[mem_key])[-8:] if isinstance(m.get("content"), str)]
+    if recent:
+        convo = "\n".join(
+            f'{"Boss" if m["role"] == "user" else "Zun"}: {m["content"][:300]}' for m in recent
+        )
+        context += f"\nHội thoại ngay trước đó (mới nhất ở cuối):\n{convo}"
     # Cho AI thấy tên THẬT trong server để trích đúng ("chat chung" -> kênh 'chung').
     guild = message.guild
     text_names = ", ".join(c.name for c in guild.text_channels[:60])
@@ -5037,12 +5055,15 @@ async def handle_owner_admin_request(message, prompt):
     )
     data = _extract_json_object(raw)
     actions = data.get("actions") if isinstance(data, dict) else None
-    if not isinstance(actions, list) or not actions:
-        return False
+    if not isinstance(actions, list):
+        return []
+    return [a for a in actions[:10] if isinstance(a, dict)]
+
+
+async def run_owner_admin_actions(message, prompt, actions):
+    """Thực thi actions, báo kết quả, ghi memory để câu sau ("đổi lại đi") bot còn nhớ đã làm gì."""
     results = []
-    for action in actions[:10]:
-        if not isinstance(action, dict):
-            continue
+    for action in actions:
         try:
             results.append(await _run_admin_action(message, action))
         except LookupError as exc:
@@ -5053,10 +5074,11 @@ async def handle_owner_admin_request(message, prompt):
             )
         except Exception as exc:
             results.append(f"❌ '{action.get('type')}' lỗi {type(exc).__name__}")
-    if not results:
-        return False
-    await send_reply(message, "\n".join(results))
-    return True
+    summary = "\n".join(results) or "không làm được gì"
+    await send_reply(message, summary)
+    mem_key = (message.channel.id, message.author.id)
+    memory[mem_key].append({"role": "user", "content": prompt[:2000]})
+    memory[mem_key].append({"role": "assistant", "content": summary[:2000]})
 
 
 # ==================== SLASH COMMANDS ====================
