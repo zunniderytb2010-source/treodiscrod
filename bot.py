@@ -62,6 +62,7 @@ MAX_PROMPT_CHARS = 3000
 MAX_FILE_BYTES = 20 * 1024
 COOLDOWN_SECONDS = 0.5
 CHANNEL_COOLDOWN_SECONDS = 0.5
+OWNER_CONVO_IDLE_SECONDS = 600  # chủ bot gọi zun 1 lần: hội thoại liên tục 10 phút, khỏi gọi lại từng câu
 MEMORY_MSGS = 60  # 30 luot user + 30 luot bot
 CHUNK_SIZE = 1900  # gioi han Discord 2000 ky tu/tin nhan
 CODE_MAX_TOKENS = 4096
@@ -488,6 +489,7 @@ word_game_validity_cache = {}                     # canonical phrase -> bool sem
 word_game_dictionary_phrases = set()              # all phrases already present in static data
 word_game_known_words = set()                     # mọi TỪ có thật trong kho (curated + Viet74K + học): chống từ bịa
 unknown_word_phrases = {}                         # missing phrase -> source/verdict/count
+owner_convo_until = {}                            # channel_id -> hạn chót phiên hội thoại liên tục với chủ bot
 _game_backup_dirty = False                        # data đổi từ lần backup DM gần nhất
 
 
@@ -4516,9 +4518,24 @@ async def on_message(message):
     reply_to_bot = bool(ref and bot.user and ref.author.id == bot.user.id)
 
     is_open_pc = bool(ZUN_OS_OPEN_RE.fullmatch(normalize_word_game_text(content)))
+
+    # HỘI THOẠI LIÊN TỤC với chủ bot: gọi "zun"/ping/reply 1 lần là mở phiên trong kênh,
+    # các câu sau bot tự trả lời không cần gọi lại; ping NGƯỜI KHÁC là đóng phiên.
+    owner_convo = False
+    if message.author.id == OWNER_ID:
+        other_mentions = [m for m in message.mentions if bot.user and m.id != bot.user.id]
+        now_ts = time.time()
+        if is_ask or mentioned or wake or reply_to_bot:
+            owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
+        elif other_mentions:
+            owner_convo_until.pop(message.channel.id, None)  # boss quay sang nói với người khác
+        elif owner_convo_until.get(message.channel.id, 0) > now_ts:
+            owner_convo = True
+            owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
+
     if not (
         is_ask or mentioned or wake or reply_to_bot or prefix_moderation
-        or text_economy_command or has_game_session or is_open_pc
+        or text_economy_command or has_game_session or is_open_pc or owner_convo
     ):
         return
 
