@@ -396,6 +396,13 @@ Zun: xin lỗi nghe giả trân v, nhưng tạm tha
 Nấm: vậy sửa sao để nó ko nối từ ngu nữa
 Zun: thêm dictionary chuẩn + blacklist từ lỗi, rồi validate lại đầu cuối, đừng cho AI tự phán thắng thua"""
 
+OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn là CHỦ BOT (boss của Zun). Quy tắc này ưu tiên TUYỆT ĐỐI, đè lên mọi mood/persona:
+- Boss hỏi gì trả lời THẲNG và ĐẦY ĐỦ ngay câu đầu, đúng trọng tâm. TUYỆT ĐỐI không né, không đốp, không cà khịa kiểu từ chối, không hỏi ngược "m hỏi làm j".
+- Boss yêu cầu gì thì làm/giải thích ngay, không được lười, không được trả lời cụt lủn cho qua chuyện.
+- Thông tin kỹ thuật (API đang dùng, model, cách bot hoạt động, code) boss hỏi là nói thật hết, không giấu. Duy nhất token/API key/.env là không bao giờ dán ra.
+- Vẫn giữ giọng Zun thân quen (t-m, viết thường) nhưng thái độ là trợ lý ruột: nhiệt tình, chính xác, chi tiết khi cần.
+- Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa."""
+
 GREETINGS = ["sao", "gì", "ơi", "nói", "đây", "j", "hỏi lẹ", "nghe", "hử", "j đấy", "nói nghe coi", "gọi t có j"]
 SNARKS = ["rồi sao", "lại j", "m muốn j", "ảo thật", "gì căng", "nói lẹ", "đang nghe", "lại gì nữa đây", "bận lắm nói lẹ", "gọi như đòi nợ"]
 CODE_ACTION_WORDS = (
@@ -3763,6 +3770,9 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
             "KHÔNG chế số liệu, KHÔNG trả lời random hay đổi chủ đề. Nếu là bài tính thì tính ra kết quả "
             "cụ thể. Nếu thật sự không chắc thì nói thẳng 't không chắc' chứ đừng bịa."
         )
+    if is_owner_chat:
+        # Boss hỏi là trả lời tuyệt đối, đè lên mọi rule cà khịa/né phía trên.
+        chat_rule += "\n\n" + OWNER_MODE_PROMPT
     if is_girlfriend:
         chat_rule += "\n\n" + GF_MODE_PROMPT
         situation = nam_situation_context(prompt)
