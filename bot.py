@@ -403,7 +403,7 @@ OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn CHÍNH LÀ CHỦ BOT (bo
 - Thông tin kỹ thuật (API đang dùng, model, cách bot hoạt động, code) boss hỏi là nói thật hết, không giấu. Duy nhất token/API key/.env là không bao giờ dán ra.
 - Vẫn giữ giọng Zun thân quen (t-m, viết thường) nhưng thái độ là trợ lý ruột: nhiệt tình, chính xác, chi tiết khi cần.
 - Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa.
-- CẤM chém đã làm hành động quản trị (đổi tên kênh, mute, tạo role...) khi hội thoại không có kết quả ✅ thật. Chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi"."""
+- Kết quả quản trị có "✅" trong hội thoại/log là bot ĐÃ LÀM THẬT trên server (mute đã ăn, kênh đã đổi tên...) — TUYỆT ĐỐI không chối, không nói "chém thôi/chưa mute được thật". Ngược lại KHÔNG có ✅ thì đừng chém là đã làm; chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi"."""
 
 GREETINGS = ["sao", "gì", "ơi", "nói", "đây", "j", "hỏi lẹ", "nghe", "hử", "j đấy", "nói nghe coi", "gọi t có j"]
 SNARKS = ["rồi sao", "lại j", "m muốn j", "ảo thật", "gì căng", "nói lẹ", "đang nghe", "lại gì nữa đây", "bận lắm nói lẹ", "gọi như đòi nợ"]
@@ -490,6 +490,7 @@ word_game_dictionary_phrases = set()              # all phrases already present 
 word_game_known_words = set()                     # mọi TỪ có thật trong kho (curated + Viet74K + học): chống từ bịa
 unknown_word_phrases = {}                         # missing phrase -> source/verdict/count
 owner_convo_until = {}                            # channel_id -> hạn chót phiên hội thoại liên tục với chủ bot
+admin_action_log = defaultdict(lambda: deque(maxlen=10))  # channel_id -> hành động admin ĐÃ làm thật
 _game_backup_dirty = False                        # data đổi từ lần backup DM gần nhất
 
 
@@ -3796,6 +3797,18 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
             "bot viết bằng discord.py (Python), chạy trên Render. Với người KHÁC hỏi thì chỉ nói chung chung "
             "'bot discord chat thôi', không tiết lộ model/hạ tầng. Không bao giờ dán key/token ra chat.]"
         )
+        recent_admin = list(admin_action_log.get(channel_id) or ())[-6:]
+        if recent_admin:
+            now_ts = time.time()
+            action_lines = "\n".join(
+                f"- {max(0, int((now_ts - ts) / 60))} phút trước: {s}" for ts, s in recent_admin
+            )
+            chat_rule += (
+                "\n[SỰ THẬT — hành động quản trị bot ĐÃ THỰC THI THẬT trong kênh này:\n"
+                + action_lines
+                + "\nDòng có ✅ là ĐÃ XẢY RA THẬT trên server (mute/đổi tên/role... đã ăn). "
+                  "TUYỆT ĐỐI không chối, không nói 'chém thôi/chưa làm được'.]"
+            )
     if is_girlfriend:
         chat_rule += "\n\n" + GF_MODE_PROMPT
         situation = nam_situation_context(prompt)
@@ -5142,6 +5155,8 @@ async def run_owner_admin_actions(message, prompt, actions):
     mem_key = (message.channel.id, message.author.id)
     memory[mem_key].append({"role": "user", "content": prompt[:2000]})
     memory[mem_key].append({"role": "assistant", "content": summary[:2000]})
+    # Ghi log hành động THẬT để chat sau này không tự chối "chém thôi chưa làm".
+    admin_action_log[message.channel.id].append((time.time(), summary.replace("\n", "; ")[:300]))
 
 
 # ==================== SLASH COMMANDS ====================
