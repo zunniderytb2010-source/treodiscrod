@@ -77,6 +77,7 @@ CHAT_MAX_TOKENS = 600
 CODE_THINKING_BUDGET = 4096  # chi code mode moi bat thinking; chat thuong tat de tra loi nhanh ~2s
 OWNER_THINKING_BUDGET = 4096
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_READ_BYTES = 25 * 1024 * 1024  # ảnh 5-25MB thì tải về NÉN cho vừa chứ không vứt
 ALLOWED_EXT = (".txt", ".py", ".js", ".json", ".lua", ".md")
 IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -4069,6 +4070,29 @@ async def read_attachments(message):
     return "\n\n".join(parts)
 
 
+def compress_image(data):
+    """Ảnh quá 5MB: thu cạnh dài về 1600px + JPEG q80 — vision không cần ảnh 4K.
+
+    Trả (bytes, media_type) hoặc (None, None) nếu nén không nổi/thiếu Pillow.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None
+    try:
+        img = Image.open(io.BytesIO(data))
+        img = img.convert("RGB")
+        img.thumbnail((1600, 1600))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=80)
+        result = out.getvalue()
+        if len(result) > MAX_IMAGE_BYTES:
+            return None, None
+        return result, "image/jpeg"
+    except Exception:
+        return None, None
+
+
 async def read_image_blocks(attachments):
     """Đổi ảnh Discord thành content block cho Claude Vision."""
     blocks = []
@@ -4078,11 +4102,18 @@ async def read_image_blocks(attachments):
         media_type = IMAGE_MEDIA_TYPES.get(ext)
         if not media_type:
             continue
-        if att.size > MAX_IMAGE_BYTES:
-            warnings.append(f"[Ảnh {att.filename} quá 5MB nên bỏ qua]")
+        if att.size > MAX_IMAGE_READ_BYTES:
+            warnings.append(f"[Ảnh {att.filename} quá 25MB nên bỏ qua, nhờ user gửi ảnh nhẹ hơn]")
             continue
         try:
             data = await att.read()
+            if len(data) > MAX_IMAGE_BYTES:
+                data, media_type = compress_image(data)
+                if data is None:
+                    warnings.append(
+                        f"[Ảnh {att.filename} quá to nén không nổi nên bỏ qua, nhờ user gửi ảnh nhẹ hơn]"
+                    )
+                    continue
             blocks.append({
                 "type": "image",
                 "source": {
