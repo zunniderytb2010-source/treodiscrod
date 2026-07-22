@@ -3819,7 +3819,10 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         else:
             chat_rule += "\nNấm chưa nói gì sến nên lần này tuyệt đối không nói yêu em, nhớ em hay câu sến, chỉ trêu láo yêu nhẹ thôi."
     messages = [{"role": "system", "content": build_system(gid) + "\n\n" + chat_rule}]
-    messages += list(memory[key])
+    history = list(memory[key])
+    if is_owner_chat:
+        history = history[-24:]  # GLM tính tiền theo input: cắt memory 60 -> 24 tin cho đỡ đốt token
+    messages += history
     context_parts = [part for part in (recent_context, extra_context) if part]
     speaker = "Nấm" if is_girlfriend else (user_name or "user")
     context_parts.append(f"[Câu {speaker} vừa nói với Zun]\n{prompt}")
@@ -4763,7 +4766,9 @@ async def on_message(message):
         # TRỢ LÝ ADMIN chạy SONG SONG với chat cho nhanh: có hành động thì làm hành động
         # (huỷ chat), không thì lấy câu chat — chỉ chờ 1 lượt AI thay vì 2 lượt nối đuôi.
         admin_task = None
-        if is_owner(message.author) and message.guild:
+        if is_owner(message.author) and message.guild and (
+            owner_convo_check or ADMIN_HINT_RE.search(prompt or "")
+        ):
             admin_task = asyncio.create_task(parse_owner_admin_actions(message, prompt, ref))
         chat_task = asyncio.create_task(ai_chat(
             gid,
@@ -4828,6 +4833,15 @@ ADMIN_INTENT_PROMPT = (
     "vẫn LÀ hành động quản trị: dựa vào hội thoại ngay trước đó để suy ra hành động cụ thể "
     '(vd vừa đổi tên kênh "chung" thành "chat gay", chủ nói "đổi lại đi" -> '
     '{"actions":[{"type":"rename_channel","name":"chat gay","new_name":"chung"}]}).'
+)
+
+
+# Tin có mùi lệnh admin mới đáng gọi AI trích lệnh; tán gẫu thuần ("ok ok", "gay") thì khỏi,
+# tiết kiệm 1 lượt GLM mỗi tin. Tin ping/reply người khác trong phiên vẫn luôn được phân tích.
+ADMIN_HINT_RE = re.compile(
+    r"(?i)(mute|unmute|\bban\b|unban|kick|timeout|role|slowmode|invite"
+    r"|mời|\blink\b|tạo|xóa|xoá|đổi|rename|chuyển|danh mục|kênh|tab|câm|\bđá\b|đuổi"
+    r"|hoàn tác|như cũ|cấm|gỡ|xử|phạt|quyền)"
 )
 
 
@@ -5098,10 +5112,10 @@ async def parse_owner_admin_actions(message, prompt, ref=None):
         context += f"\nHội thoại ngay trước đó (mới nhất ở cuối):\n{convo}"
     # Cho AI thấy tên THẬT trong server để trích đúng ("chat chung" -> kênh 'chung').
     guild = message.guild
-    text_names = ", ".join(c.name for c in guild.text_channels[:60])
-    voice_names = ", ".join(c.name for c in guild.voice_channels[:30])
-    category_names = ", ".join(c.name for c in guild.categories[:20])
-    role_names = ", ".join(r.name for r in guild.roles[1:50])  # bỏ @everyone
+    text_names = ", ".join(c.name for c in guild.text_channels[:40])
+    voice_names = ", ".join(c.name for c in guild.voice_channels[:15])
+    category_names = ", ".join(c.name for c in guild.categories[:15])
+    role_names = ", ".join(r.name for r in guild.roles[1:30])  # bỏ @everyone
     context += (
         f"\nKênh text hiện có: {text_names or '(không)'}"
         f"\nKênh voice hiện có: {voice_names or '(không)'}"
