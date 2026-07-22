@@ -54,6 +54,10 @@ GEMINI_KEYS = _load_gemini_keys()
 # Mọi người dùng Gemini; hết key Gemini là họ hết dùng, còn chủ bot vẫn chạy bằng GLM.
 ZAI_API_KEY = (os.getenv("ZAI_API_KEY") or "").strip()
 ZAI_MODEL = (os.getenv("ZAI_MODEL") or "glm-5.2").strip() or "glm-5.2"
+# Tách model theo việc: chat tán gẫu (nhiều lượt, model rẻ/free là đủ) vs trích lệnh admin
+# (hiếm lượt nhưng cần chuẩn, mute nhầm người là toang). Không set thì cả 2 dùng ZAI_MODEL.
+ZAI_CHAT_MODEL = (os.getenv("ZAI_CHAT_MODEL") or "").strip() or ZAI_MODEL
+ZAI_ADMIN_MODEL = (os.getenv("ZAI_ADMIN_MODEL") or "").strip() or ZAI_MODEL
 ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 
 MODEL = GEMINI_MODEL
@@ -3644,10 +3648,10 @@ def _to_openai_payload(messages):
     return out
 
 
-async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85):
+async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, model=None):
     """Gọi GLM của z.ai (chỉ dành cho chủ bot). Lỗi thì raise để caller rơi về Gemini."""
     body = {
-        "model": ZAI_MODEL,
+        "model": model or ZAI_MODEL,
         "messages": _to_openai_payload(messages),
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -3674,7 +3678,7 @@ _GEMINI_SAFETY = [
 ]
 
 
-async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None, owner=False):
+async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinking_budget=0, model=None, owner=False, zai_model=None):
     """Gọi Gemini API, xoay qua các key. Tên hàm giữ nguyên cho khỏi sửa nơi gọi.
 
     thinking_budget bỏ (Gemini flash không có). Hết sạch key -> AllKeysExhaustedError.
@@ -3684,7 +3688,7 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
     global _gemini_key_index
     if owner and ZAI_API_KEY:
         try:
-            return await _zai(messages, max_tokens=max_tokens, temperature=temperature)
+            return await _zai(messages, max_tokens=max_tokens, temperature=temperature, model=zai_model)
         except Exception as exc:
             log.warning("z.ai GLM lỗi (%s), chủ bot tạm rơi về Gemini", type(exc).__name__)
     keys = _keys_in_rotation()
@@ -3790,7 +3794,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         # Boss hỏi là trả lời tuyệt đối, đè lên mọi rule cà khịa/né phía trên.
         chat_rule += "\n\n" + OWNER_MODE_PROMPT
         # Thông tin runtime thật để boss hỏi "đang sài api j" là đáp chuẩn, không phải đoán.
-        zai_state = f"model {ZAI_MODEL} (đang bật)" if ZAI_API_KEY else f"model {ZAI_MODEL} (chưa có key, boss tạm chạy Gemini)"
+        zai_state = f"model {ZAI_CHAT_MODEL} (đang bật)" if ZAI_API_KEY else f"model {ZAI_CHAT_MODEL} (chưa có key, boss tạm chạy Gemini)"
         chat_rule += (
             f"\n[Thông tin thật về chính bot, chỉ nói khi boss hỏi: chat của mọi người chạy Gemini API "
             f"model {GEMINI_MODEL} với {len(GEMINI_KEYS)} key xoay vòng; chat của boss chạy GLM z.ai {zai_state}; "
@@ -3841,7 +3845,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     else:
         temperature = 0.8
     thinking_budget = CODE_THINKING_BUDGET if code_mode else (OWNER_THINKING_BUDGET if force_thinking else 0)
-    answer = await _claude(messages, max_tokens, temperature, thinking_budget, owner=is_owner_chat)
+    answer = await _claude(messages, max_tokens, temperature, thinking_budget, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
 
     # Một lần sửa định dạng nếu model hứa đưa code nhưng chưa thực sự dán code.
     if code_mode and requires_code_block(prompt) and "```" not in answer:
@@ -3856,7 +3860,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 ),
             },
         ]
-        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_owner_chat)
+        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
 
     # Model phun THOUGHT/phân tích thay vì lời chat: cắt meta, nếu vẫn hỏng thì hỏi lại 1 lần cực gắt.
     if not code_mode:
@@ -3870,7 +3874,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 )},
             ]
             try:
-                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0, owner=is_owner_chat)
+                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
                 retry = strip_meta_reasoning(retry)
                 cleaned = retry if (retry and not looks_like_meta(retry)) else ""
             except Exception:
@@ -5132,6 +5136,7 @@ async def parse_owner_admin_actions(message, prompt, ref=None):
         max_tokens=700,
         temperature=0,
         owner=True,
+        zai_model=ZAI_ADMIN_MODEL,
     )
     data = _extract_json_object(raw)
     if not isinstance(data, dict):
