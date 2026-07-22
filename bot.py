@@ -27,6 +27,10 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1191954573200457758"))
 GIRLFRIEND_ID = int(os.getenv("GIRLFRIEND_ID", "1197183310342914150"))
+GIRLFRIEND_ID2 = int(os.getenv("GIRLFRIEND_ID2", "0"))
+# VIP = boss + 2 người yêu: chat chạy GLM z.ai riêng (không đốt key Gemini), được vào
+# phiên hội thoại liên tục nhóm. CHỈ boss có quyền ra lệnh admin.
+VIP_IDS = {OWNER_ID, GIRLFRIEND_ID, GIRLFRIEND_ID2} - {0}
 
 
 # AI: Gemini API với xoay nhiều key. Hết sạch key thì bot im, không trả lời.
@@ -497,7 +501,7 @@ word_game_validity_cache = {}                     # canonical phrase -> bool sem
 word_game_dictionary_phrases = set()              # all phrases already present in static data
 word_game_known_words = set()                     # mọi TỪ có thật trong kho (curated + Viet74K + học): chống từ bịa
 unknown_word_phrases = {}                         # missing phrase -> source/verdict/count
-owner_convo_until = {}                            # channel_id -> hạn chót phiên hội thoại liên tục với chủ bot
+vip_convo = {}                                    # channel_id -> {"until": ts, "members": set} phiên hội thoại nhóm VIP
 admin_action_log = defaultdict(lambda: deque(maxlen=10))  # channel_id -> hành động admin ĐÃ làm thật
 _game_backup_dirty = False                        # data đổi từ lần backup DM gần nhất
 
@@ -3575,8 +3579,8 @@ def gemini_keys_available():
 
 
 def ai_available_for(user):
-    """Chủ bot có GLM z.ai riêng nên không phụ thuộc Gemini; người khác hết key Gemini là hết dùng."""
-    if user is not None and getattr(user, "id", None) == OWNER_ID and ZAI_API_KEY:
+    """VIP (boss + 2 người yêu) có GLM z.ai riêng nên không phụ thuộc Gemini; người khác hết key Gemini là hết dùng."""
+    if user is not None and getattr(user, "id", None) in VIP_IDS and ZAI_API_KEY:
         return True
     return gemini_keys_available()
 
@@ -3748,7 +3752,8 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     """Chat có memory theo (channel, user)."""
     channel_id = key[0]
     is_girlfriend = key[1] == GIRLFRIEND_ID
-    is_owner_chat = key[1] == OWNER_ID  # chủ bot -> chạy GLM z.ai riêng
+    is_owner_chat = key[1] == OWNER_ID  # chỉ boss mới ăn BOSS MODE
+    is_vip_chat = key[1] in VIP_IDS    # boss + 2 người yêu -> chạy GLM z.ai riêng
 
     # Toán đơn giản: tự tính cho chắc đúng, model nhỏ hay tính sai/né.
     if not image_blocks:
@@ -3857,7 +3862,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
     else:
         temperature = 0.8
     thinking_budget = CODE_THINKING_BUDGET if code_mode else (OWNER_THINKING_BUDGET if force_thinking else 0)
-    answer = await _claude(messages, max_tokens, temperature, thinking_budget, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
+    answer = await _claude(messages, max_tokens, temperature, thinking_budget, owner=is_vip_chat, zai_model=ZAI_CHAT_MODEL)
 
     # Một lần sửa định dạng nếu model hứa đưa code nhưng chưa thực sự dán code.
     if code_mode and requires_code_block(prompt) and "```" not in answer:
@@ -3872,7 +3877,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 ),
             },
         ]
-        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
+        answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_vip_chat, zai_model=ZAI_CHAT_MODEL)
 
     # Model phun THOUGHT/phân tích thay vì lời chat: cắt meta, nếu vẫn hỏng thì hỏi lại 1 lần cực gắt.
     if not code_mode:
@@ -3886,7 +3891,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 )},
             ]
             try:
-                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0, owner=is_owner_chat, zai_model=ZAI_CHAT_MODEL)
+                retry = await _claude(retry_messages, CHAT_MAX_TOKENS, 0.7, 0, owner=is_vip_chat, zai_model=ZAI_CHAT_MODEL)
                 retry = strip_meta_reasoning(retry)
                 cleaned = retry if (retry and not looks_like_meta(retry)) else ""
             except Exception:
@@ -4581,23 +4586,33 @@ async def on_message(message):
 
     is_open_pc = bool(ZUN_OS_OPEN_RE.fullmatch(normalize_word_game_text(content)))
 
-    # HỘI THOẠI LIÊN TỤC với chủ bot: gọi "zun"/ping/reply 1 lần là mở phiên trong kênh,
-    # các câu sau bot tự trả lời không cần gọi lại. Tin ping/reply NGƯỜI KHÁC trong phiên
-    # KHÔNG chặn cứng: để AI đọc phán boss đang nói với bot ("mute thk chó này") hay với họ.
+    # HỘI THOẠI LIÊN TỤC NHÓM VIP (boss + 2 người yêu): 1 người gọi "zun"/ping/reply là mở
+    # phiên trong kênh; VIP khác ping bot là THAM GIA (2 người -> 3 người), xong ai trong
+    # phiên nhắn gì bot cũng trả lời. Riêng boss ping/reply người khác thì AI phán tiếp
+    # ("mute thk chó này" = lệnh cho bot); người yêu ping/reply người khác = nói với người đó.
     owner_convo = False
     owner_convo_check = False
-    if message.author.id == OWNER_ID:
+    if message.author.id in VIP_IDS:
+        now_ts = time.time()
+        convo = vip_convo.get(message.channel.id)
+        if convo and convo["until"] <= now_ts:
+            vip_convo.pop(message.channel.id, None)
+            convo = None
         other_mentions = [m for m in message.mentions if bot.user and m.id != bot.user.id]
         replied_other = bool(ref and bot.user and ref.author.id != bot.user.id)
-        now_ts = time.time()
         if is_ask or mentioned or wake or reply_to_bot:
-            owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
-        elif owner_convo_until.get(message.channel.id, 0) > now_ts:
+            if convo is None:
+                convo = {"until": 0.0, "members": set()}
+                vip_convo[message.channel.id] = convo
+            convo["members"].add(message.author.id)
+            convo["until"] = now_ts + OWNER_CONVO_IDLE_SECONDS
+        elif convo and message.author.id in convo["members"]:
             if other_mentions or replied_other:
-                owner_convo_check = True  # AI sẽ phán: lệnh cho bot hay nói chuyện với người kia
+                if message.author.id == OWNER_ID:
+                    owner_convo_check = True  # AI sẽ phán: lệnh cho bot hay nói chuyện với người kia
             else:
                 owner_convo = True
-            owner_convo_until[message.channel.id] = now_ts + OWNER_CONVO_IDLE_SECONDS
+            convo["until"] = now_ts + OWNER_CONVO_IDLE_SECONDS
 
     if not (
         is_ask or mentioned or wake or reply_to_bot or prefix_moderation
