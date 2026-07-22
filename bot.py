@@ -3671,23 +3671,15 @@ async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, model=Non
         "messages": _to_openai_payload(messages),
         "max_tokens": max_tokens,
         "temperature": temperature,
-        # GLM 5.x là model REASONING: mặc định nghĩ thầm trước khi trả lời -> chậm và
-        # token nghĩ thầm bị tính giá output. Chat persona không cần suy luận sâu -> tắt.
-        "thinking": {"type": "disabled"},
+        # Thinking BẬT (mặc định của GLM): chậm + tốn hơn nhưng nói chuyện khôn hơn hẳn,
+        # boss đã thử tắt và chê ngu nên giữ bật.
     }
     headers = {"Authorization": f"Bearer {ZAI_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(ZAI_API_URL, json=body, headers=headers) as resp:
-            if resp.status == 400:
-                # Model không nhận field thinking -> thử lại 1 lần không có nó.
-                body.pop("thinking", None)
-                async with session.post(ZAI_API_URL, json=body, headers=headers) as retry:
-                    retry.raise_for_status()
-                    data = await retry.json()
-            else:
-                resp.raise_for_status()
-                data = await resp.json()
+            resp.raise_for_status()
+            data = await resp.json()
     choices = data.get("choices") or []
     if not choices:
         return ""
