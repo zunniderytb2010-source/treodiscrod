@@ -58,6 +58,9 @@ ZAI_MODEL = (os.getenv("ZAI_MODEL") or "glm-5.2").strip() or "glm-5.2"
 # (hiếm lượt nhưng cần chuẩn, mute nhầm người là toang). Không set thì cả 2 dùng ZAI_MODEL.
 ZAI_CHAT_MODEL = (os.getenv("ZAI_CHAT_MODEL") or "").strip() or ZAI_MODEL
 ZAI_ADMIN_MODEL = (os.getenv("ZAI_ADMIN_MODEL") or "").strip() or ZAI_MODEL
+# Tin có ẢNH thì model text không đọc được -> tự chuyển qua model vision này.
+# z.ai: glm-5v-turbo ($1.2/$4), glm-4.6v ($0.3/$0.9), glm-4.6v-flash (free).
+ZAI_VISION_MODEL = (os.getenv("ZAI_VISION_MODEL") or "glm-5v-turbo").strip() or "glm-5v-turbo"
 ZAI_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 
 MODEL = GEMINI_MODEL
@@ -3650,8 +3653,16 @@ def _to_openai_payload(messages):
 
 async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, model=None):
     """Gọi GLM của z.ai (chỉ dành cho chủ bot). Lỗi thì raise để caller rơi về Gemini."""
+    use_model = model or ZAI_MODEL
+    # Tin có ảnh -> model text của GLM không đọc được, tự chuyển qua model VISION.
+    if any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(b, dict) and b.get("type") == "image" for b in m["content"])
+        for m in messages
+    ):
+        use_model = ZAI_VISION_MODEL
     body = {
-        "model": model or ZAI_MODEL,
+        "model": use_model,
         "messages": _to_openai_payload(messages),
         "max_tokens": max_tokens,
         "temperature": temperature,
