@@ -3669,10 +3669,11 @@ async def _zai(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, model=Non
     body = {
         "model": use_model,
         "messages": _to_openai_payload(messages),
-        "max_tokens": max_tokens,
+        # Thinking BẬT (mặc định GLM) và token NGHĨ THẦM trừ thẳng vào max_tokens: cap 600
+        # của chat là nó nghĩ hết sạch budget, content về RỖNG -> bot rơi vào câu fallback
+        # "gì v/sao" nghe ngu. Nới đủ chỗ nghĩ + trả lời; tiền tính theo token thật dùng.
+        "max_tokens": max(max_tokens, 4096),
         "temperature": temperature,
-        # Thinking BẬT (mặc định của GLM): chậm + tốn hơn nhưng nói chuyện khôn hơn hẳn,
-        # boss đã thử tắt và chê ngu nên giữ bật.
     }
     headers = {"Authorization": f"Bearer {ZAI_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT)
