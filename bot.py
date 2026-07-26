@@ -5037,6 +5037,24 @@ def _admin_parse_color(value):
         return None
 
 
+def _admin_target_error(guild, member, for_timeout=False):
+    """Lý do bot KHÔNG xử được người này (chủ server/admin/role cao hơn); None nếu ok."""
+    if member.id == guild.owner_id:
+        return f"{member.display_name} là CHỦ SERVER, không ai xử được"
+    if for_timeout and member.guild_permissions.administrator:
+        return (
+            f"{member.display_name} có quyền Administrator nên Discord CẤM timeout admin "
+            "— gỡ role admin của nó trước, hoặc dùng kick/voice_mute thay thế"
+        )
+    me = guild.me
+    if me is not None and member.top_role >= me.top_role:
+        return (
+            f'role "{member.top_role.name}" của {member.display_name} cao hơn/bằng role t '
+            "— kéo role t lên trên role đó đã"
+        )
+    return None
+
+
 async def _resolve_ref_message(message):
     """Lấy tin đang được reply (fetch nếu cache chưa có), không có thì None."""
     if not (message.reference and message.reference.message_id):
@@ -5064,6 +5082,9 @@ async def _run_admin_action(message, action):
 
     if a_type in {"timeout", "mute"}:
         member = await need_member()
+        problem = _admin_target_error(guild, member, for_timeout=True)
+        if problem:
+            raise LookupError(problem)
         minutes = 10
         try:
             minutes = max(1, min(int(action.get("minutes") or 10), 40320))  # Discord max 28 ngày
@@ -5077,6 +5098,9 @@ async def _run_admin_action(message, action):
         return f"✅ đã bỏ mute {member.display_name}"
     if a_type == "ban":
         member = await need_member()
+        problem = _admin_target_error(guild, member)
+        if problem:
+            raise LookupError(problem)
         await member.ban(reason=reason)
         return f"✅ đã ban {member.display_name}"
     if a_type == "unban":
@@ -5092,6 +5116,9 @@ async def _run_admin_action(message, action):
         raise LookupError(f'không thấy "{target}" trong danh sách ban')
     if a_type == "kick":
         member = await need_member()
+        problem = _admin_target_error(guild, member)
+        if problem:
+            raise LookupError(problem)
         await member.kick(reason=reason)
         return f"✅ đã kick {member.display_name}"
     if a_type in {"add_role", "remove_role"}:
