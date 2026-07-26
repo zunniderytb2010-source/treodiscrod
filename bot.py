@@ -4886,6 +4886,18 @@ ADMIN_INTENT_PROMPT = (
     '- slowmode: đặt chế độ chậm. Tham số: channel (bỏ trống = kênh hiện tại), seconds.\n'
     '- create_invite: tạo link mời vào server ("đưa link sv", "cho xin invite"). Tham số: '
     'channel (bỏ trống = kênh hiện tại), max_age_hours (0 = vĩnh viễn, mặc định 0), max_uses (0 = vô hạn).\n'
+    '- delete_messages: xoá tin nhắn/dọn spam trong kênh hiện tại. Tham số: target (người gửi, tuỳ chọn), '
+    'count (số tin tối đa, mặc định 5), contains (chỉ xoá tin chứa chuỗi này, tuỳ chọn, vd "youtu"). '
+    'Chủ server đang REPLY 1 tin và bảo xoá ("xoá tin này", "xoá liên kết spam này") thì để trống hết tham số '
+    '-> bot xoá đúng tin được reply.\n'
+    '- voice_mute / voice_unmute: tắt/mở MIC người đang trong voice. Tham số: target.\n'
+    '- voice_deafen / voice_undeafen: chặn/mở NGHE của người trong voice. Tham số: target.\n'
+    '- voice_move: chuyển người sang kênh voice khác. Tham số: target, channel (tên kênh voice đích).\n'
+    '- voice_kick: đá người khỏi voice. Tham số: target.\n'
+    '- set_nickname: đổi biệt danh. Tham số: target, nickname (bỏ trống = xoá biệt danh).\n'
+    '- pin_message / unpin_message: ghim/bỏ ghim tin đang được reply, không tham số.\n'
+    '- lock_channel / unlock_channel: khoá/mở kênh (chặn @everyone nhắn). Tham số: channel (bỏ trống = kênh hiện tại).\n'
+    '- send_message: bảo bot nhắn hộ. Tham số: channel (bỏ trống = kênh hiện tại), content.\n'
     'CHỈ trả về đúng một JSON object: {"actions": [{...}, ...], "to_bot": true|false}.\n'
     '"to_bot" = tin nhắn có đang nói VỚI BOT Zun không: ra lệnh/hỏi/chat với bot -> true; '
     "boss đang nói chuyện với NGƯỜI KHÁC (đáp lời người được tag/reply, khịa họ, tán gẫu với họ) -> false và actions [].\n"
@@ -4905,7 +4917,8 @@ ADMIN_INTENT_PROMPT = (
 ADMIN_HINT_RE = re.compile(
     r"(?i)(mute|unmute|\bban\b|unban|kick|timeout|role|slowmode|invite"
     r"|mời|\blink\b|tạo|xóa|xoá|đổi|rename|chuyển|danh mục|kênh|tab|câm|\bđá\b|đuổi"
-    r"|hoàn tác|như cũ|cấm|gỡ|xử|phạt|quyền)"
+    r"|hoàn tác|như cũ|cấm|gỡ|xử|phạt|quyền"
+    r"|\bmic\b|voice|ghim|khoá|khóa|biệt danh|\bnick\b|nhắn|dọn|spam|\bpin\b)"
 )
 
 
@@ -5024,6 +5037,19 @@ def _admin_parse_color(value):
         return None
 
 
+async def _resolve_ref_message(message):
+    """Lấy tin đang được reply (fetch nếu cache chưa có), không có thì None."""
+    if not (message.reference and message.reference.message_id):
+        return None
+    ref_msg = message.reference.resolved
+    if isinstance(ref_msg, discord.Message):
+        return ref_msg
+    try:
+        return await message.channel.fetch_message(message.reference.message_id)
+    except Exception:
+        return None
+
+
 async def _run_admin_action(message, action):
     guild = message.guild
     a_type = str(action.get("type") or "").strip().lower()
@@ -5122,6 +5148,38 @@ async def _run_admin_action(message, action):
             raise LookupError("không thấy kênh hoặc danh mục")
         await ch.edit(category=category, reason=reason)
         return f"✅ đã chuyển {ch.name} vào {category.name}"
+    if a_type in {"delete_messages", "purge"}:
+        # Reply thẳng 1 tin + bảo xoá (không tham số) -> xoá đúng tin đó.
+        ref_msg = await _resolve_ref_message(message)
+        if (
+            isinstance(ref_msg, discord.Message)
+            and not action.get("target") and not action.get("contains")
+        ):
+            await ref_msg.delete()
+            return "✅ đã xoá tin đó"
+        member = None
+        if action.get("target"):
+            member = await _admin_find_member(message, action.get("target"))
+            if member is None:
+                raise LookupError(f'không tìm thấy ai tên "{action.get("target")}"')
+        contains = str(action.get("contains") or "").lower()
+        count = 5
+        try:
+            count = max(1, min(int(action.get("count") or 5), 100))
+        except (ValueError, TypeError):
+            pass
+        state = {"left": count}
+        def _purge_check(m):
+            if state["left"] <= 0 or m.id == message.id:
+                return False
+            if member is not None and m.author.id != member.id:
+                return False
+            if contains and contains not in (m.content or "").lower():
+                return False
+            state["left"] -= 1
+            return True
+        purged = await message.channel.purge(limit=200, check=_purge_check)
+        return f"✅ đã xoá {len(purged)} tin nhắn"
     if a_type == "create_invite":
         fallback = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
         ch = _admin_find_channel(guild, action.get("channel"), kinds=(discord.TextChannel, discord.VoiceChannel)) or fallback
@@ -5137,6 +5195,60 @@ async def _run_admin_action(message, action):
         invite = await ch.create_invite(max_age=hours * 3600, max_uses=uses, reason=reason)
         tail = "" if not hours else f" (hết hạn sau {hours}h)"
         return f"✅ link mời: {invite.url}{tail}"
+    if a_type in {"voice_mute", "voice_unmute", "voice_deafen", "voice_undeafen", "voice_kick"}:
+        member = await need_member()
+        if member.voice is None or member.voice.channel is None:
+            raise LookupError(f"{member.display_name} đang không ở trong voice")
+        if a_type == "voice_mute":
+            await member.edit(mute=True, reason=reason)
+            return f"✅ đã tắt mic {member.display_name}"
+        if a_type == "voice_unmute":
+            await member.edit(mute=False, reason=reason)
+            return f"✅ đã mở mic {member.display_name}"
+        if a_type == "voice_deafen":
+            await member.edit(deafen=True, reason=reason)
+            return f"✅ đã chặn nghe {member.display_name}"
+        if a_type == "voice_undeafen":
+            await member.edit(deafen=False, reason=reason)
+            return f"✅ đã mở nghe {member.display_name}"
+        await member.move_to(None, reason=reason)
+        return f"✅ đã đá {member.display_name} khỏi voice"
+    if a_type == "voice_move":
+        member = await need_member()
+        if member.voice is None or member.voice.channel is None:
+            raise LookupError(f"{member.display_name} đang không ở trong voice")
+        vc = _admin_find_channel(guild, action.get("channel"), kinds=discord.VoiceChannel)
+        if vc is None:
+            raise LookupError(f'không có kênh voice tên "{action.get("channel")}"')
+        await member.move_to(vc, reason=reason)
+        return f"✅ đã chuyển {member.display_name} sang {vc.name}"
+    if a_type == "set_nickname":
+        member = await need_member()
+        nick = str(action.get("nickname") or "").strip() or None
+        await member.edit(nick=nick, reason=reason)
+        return f"✅ đã đổi biệt danh thành {nick}" if nick else f"✅ đã xoá biệt danh của {member.display_name}"
+    if a_type in {"pin_message", "unpin_message"}:
+        ref_msg = await _resolve_ref_message(message)
+        if ref_msg is None:
+            raise LookupError("reply vào tin cần ghim/bỏ ghim rồi nói lại")
+        if a_type == "pin_message":
+            await ref_msg.pin(reason=reason)
+            return "✅ đã ghim tin đó"
+        await ref_msg.unpin(reason=reason)
+        return "✅ đã bỏ ghim tin đó"
+    if a_type in {"lock_channel", "unlock_channel"}:
+        ch = _admin_find_channel(guild, action.get("channel"), kinds=discord.TextChannel) or message.channel
+        overwrite = ch.overwrites_for(guild.default_role)
+        overwrite.send_messages = False if a_type == "lock_channel" else None
+        await ch.set_permissions(guild.default_role, overwrite=overwrite, reason=reason)
+        return f"✅ đã {'khoá' if a_type == 'lock_channel' else 'mở'} kênh #{ch.name}"
+    if a_type == "send_message":
+        ch = _admin_find_channel(guild, action.get("channel"), kinds=discord.TextChannel) or message.channel
+        text = str(action.get("content") or "").strip()
+        if not text:
+            raise LookupError("thiếu nội dung cần nhắn")
+        await ch.send(text[:1500])
+        return f"✅ đã nhắn vào #{ch.name}"
     if a_type == "slowmode":
         ch = _admin_find_channel(guild, action.get("channel"), kinds=discord.TextChannel) or message.channel
         seconds = 0
