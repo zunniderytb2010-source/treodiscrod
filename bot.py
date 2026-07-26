@@ -415,7 +415,9 @@ OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn CHÍNH LÀ CHỦ BOT (bo
 - Thông tin kỹ thuật (API đang dùng, model, cách bot hoạt động, code) boss hỏi là nói thật hết, không giấu. Duy nhất token/API key/.env là không bao giờ dán ra.
 - Vẫn giữ giọng Zun thân quen (t-m, viết thường) nhưng thái độ là trợ lý ruột: nhiệt tình, chính xác, chi tiết khi cần.
 - Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa.
-- Kết quả quản trị có "✅" trong hội thoại/log là bot ĐÃ LÀM THẬT trên server (mute đã ăn, kênh đã đổi tên...) — TUYỆT ĐỐI không chối, không nói "chém thôi/chưa mute được thật". Ngược lại KHÔNG có ✅ thì đừng chém là đã làm; chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi"."""
+- Kết quả quản trị có "✅" trong hội thoại/log là bot ĐÃ LÀM THẬT trên server (mute đã ăn, kênh đã đổi tên...) — TUYỆT ĐỐI không chối, không nói "chém thôi/chưa mute được thật". Ngược lại KHÔNG có ✅ thì đừng chém là đã làm; chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi".
+- Boss TRANH LUẬN/phản biện dài thì phải đáp THẲNG vào từng ý bằng lập luận thật, thừa nhận chỗ boss nói đúng, cãi lại chỗ sai kèm lý do. CẤM né bằng một câu khịa cụt lủn không liên quan hay đổi chủ đề.
+- Viết THUẦN tiếng Việt, tuyệt đối không lẫn chữ Hán/Trung/Nhật vào câu."""
 
 GREETINGS = ["sao", "gì", "ơi", "nói", "đây", "j", "hỏi lẹ", "nghe", "hử", "j đấy", "nói nghe coi", "gọi t có j"]
 SNARKS = ["rồi sao", "lại j", "m muốn j", "ảo thật", "gì căng", "nói lẹ", "đang nghe", "lại gì nữa đây", "bận lắm nói lẹ", "gọi như đòi nợ"]
@@ -3751,6 +3753,10 @@ async def _claude(messages, max_tokens=CHAT_MAX_TOKENS, temperature=0.85, thinki
     raise AllKeysExhaustedError()
 
 
+# Chữ Hán/Nhật/Hàn: GLM hay lẫn vào câu Việt, phải lọc sạch.
+_CJK_RE = re.compile(r"[⺀-鿿぀-ヿ가-힯豈-﫿]")
+
+
 async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks=None, force_thinking=False):
     """Chat có memory theo (channel, user)."""
     channel_id = key[0]
@@ -3883,6 +3889,7 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
         answer = await _claude(repair_messages, CODE_MAX_TOKENS, 0.45, CODE_THINKING_BUDGET, owner=is_vip_chat, zai_model=ZAI_CHAT_MODEL)
 
     # Model phun THOUGHT/phân tích thay vì lời chat: cắt meta, nếu vẫn hỏng thì hỏi lại 1 lần cực gắt.
+    # _CJK_RE: chữ Hán/Nhật/Hàn không bao giờ thuộc câu tiếng Việt của Zun.
     if not code_mode:
         cleaned = strip_meta_reasoning(answer)
         if not cleaned or looks_like_meta(cleaned):
@@ -3899,6 +3906,26 @@ async def ai_chat(gid, key, prompt, extra_context="", user_name="", image_blocks
                 cleaned = retry if (retry and not looks_like_meta(retry)) else ""
             except Exception:
                 cleaned = ""
+        # GLM (model Trung) thỉnh thoảng lẫn chữ Hán vào câu Việt ("t又不是 chó") -> bắt viết lại,
+        # kẹt quá thì lọc thẳng ký tự Hán ra.
+        if cleaned and _CJK_RE.search(cleaned):
+            fix_messages = messages + [
+                {"role": "assistant", "content": cleaned},
+                {"role": "user", "content": (
+                    "Câu trên bị lẫn chữ Trung Quốc. Viết lại đúng ý đó bằng THUẦN tiếng Việt, "
+                    "tuyệt đối không ký tự Hán/Trung/Nhật."
+                )},
+            ]
+            try:
+                refix = strip_meta_reasoning(
+                    await _claude(fix_messages, CHAT_MAX_TOKENS, 0.5, 0, owner=is_vip_chat, zai_model=ZAI_CHAT_MODEL)
+                )
+            except Exception:
+                refix = ""
+            if refix and not _CJK_RE.search(refix) and not looks_like_meta(refix):
+                cleaned = refix
+            else:
+                cleaned = re.sub(r"\s+", " ", _CJK_RE.sub("", cleaned)).strip()
         answer = cleaned or random.choice(["gì v", "sao", "hử", "nói lẹ", "j đó"])
 
     answer = ensure_code_fenced(answer, prompt) if code_mode else answer
