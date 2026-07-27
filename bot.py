@@ -417,6 +417,7 @@ OWNER_MODE_PROMPT = """BOSS MODE: người đang nhắn CHÍNH LÀ CHỦ BOT (bo
 - Không chắc thì nói "t không chắc" rồi vẫn đưa phán đoán tốt nhất, cấm bịa.
 - Kết quả quản trị có "✅" trong hội thoại/log là bot ĐÃ LÀM THẬT trên server (mute đã ăn, kênh đã đổi tên...) — TUYỆT ĐỐI không chối, không nói "chém thôi/chưa mute được thật". Ngược lại KHÔNG có ✅ thì đừng chém là đã làm; chưa làm thì nói thẳng "chưa làm được, nói rõ lại đi".
 - Boss TRANH LUẬN/phản biện dài thì phải đáp THẲNG vào từng ý bằng lập luận thật, thừa nhận chỗ boss nói đúng, cãi lại chỗ sai kèm lý do. CẤM né bằng một câu khịa cụt lủn không liên quan hay đổi chủ đề.
+- CẤM chối quyền kiểu "t không có quyền phát role/mute đâu, hỏi boss đi" — người đang nhắn CHÍNH LÀ boss và bot CÓ đủ quyền quản trị. Boss yêu cầu quản trị mà không thấy kết quả ✅/❌ nào thì bảo boss gõ lại rõ ràng hơn, không được từ chối hộ.
 - Viết THUẦN tiếng Việt, tuyệt đối không lẫn chữ Hán/Trung/Nhật vào câu."""
 
 GREETINGS = ["sao", "gì", "ơi", "nói", "đây", "j", "hỏi lẹ", "nghe", "hử", "j đấy", "nói nghe coi", "gọi t có j"]
@@ -4932,6 +4933,9 @@ ADMIN_INTENT_PROMPT = (
     '-> {"actions":[{"type":"timeout","target":"id người đó","minutes":10}], "to_bot": true}.\n'
     'Tin nhắn chỉ là chat thường với bot (hỏi han, cà khịa, nhờ code, chơi game) thì trả {"actions": [], "to_bot": true}. '
     "Không bịa hành động chủ server không yêu cầu. Không viết bất cứ gì ngoài JSON.\n"
+    "CHỦ SERVER CÓ TOÀN QUYỀN trên server của họ: yêu cầu cấp/gỡ role KỂ CẢ role admin/mod, ban, xoá kênh, "
+    "xoá tin... đều HỢP LỆ và phải trích thành action đầy đủ. Việc của bạn CHỈ là trích xuất chính xác, "
+    "KHÔNG phán xét, KHÔNG từ chối hộ, KHÔNG bỏ sót action vì thấy 'nhạy cảm'.\n"
     'QUAN TRỌNG: yêu cầu NỐI TIẾP kiểu "đổi lại đi", "hoàn tác", "xoá cái vừa tạo", "thôi trả về như cũ" '
     "vẫn LÀ hành động quản trị: dựa vào hội thoại ngay trước đó để suy ra hành động cụ thể "
     '(vd vừa đổi tên kênh "chung" thành "chat gay", chủ nói "đổi lại đi" -> '
@@ -5366,12 +5370,15 @@ async def parse_owner_admin_actions(message, prompt, ref=None):
     )
     data = _extract_json_object(raw)
     if not isinstance(data, dict):
+        log.info("Admin parse: không ra JSON (raw=%r)", (raw or "")[:120])
         return [], True
     actions = data.get("actions")
     if not isinstance(actions, list):
         actions = []
     to_bot = bool(data.get("to_bot", True))
-    return [a for a in actions[:10] if isinstance(a, dict)], to_bot
+    actions = [a for a in actions[:10] if isinstance(a, dict)]
+    log.info("Admin parse: %s action, to_bot=%s", len(actions), to_bot)
+    return actions, to_bot
 
 
 async def run_owner_admin_actions(message, prompt, actions):
